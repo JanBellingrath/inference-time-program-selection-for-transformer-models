@@ -1,0 +1,14 @@
+torch
+transformers
+datasets
+tqdm
+numpy
+matplotlib
+seaborn
+pandas
+scipy
+wandb
+accelerate
+bitsandbytes
+trl
+peft

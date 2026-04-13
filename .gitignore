@@ -1,0 +1,66 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# Environments
+.env
+.venv
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Tools
+.ruff_cache/
+.mypy_cache/
+
+# Logs
+*.log
+nohup.out
+nohup*.out
+
+# Model checkpoints & weights
+*.pt
+*.pth
+*.bin
+*.safetensors
+checkpoints/
+wandb/
+
+# Data artifacts (generated at runtime)
+fine_routing_data*/
+fine_routing_configs/
+ft_study_results*/
+cache/
+data/
+
+# Predictions output (keep scripts, ignore heavy artifacts)
+predictions/**/*.json
+predictions/**/*.jsonl
+predictions/**/*.png
+predictions/**/*.pdf
+!predictions/**/*.py
+
+# Results
+results/
+eval_results/
+figures/
+plots/
+assets/

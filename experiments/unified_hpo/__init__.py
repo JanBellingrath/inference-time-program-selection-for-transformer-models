@@ -1,12 +1,10 @@
-"""Unified SMAC + Hyperband hyperparameter search for single-benchmark fine routers.
+"""Unified SMAC + Hyperband (training fidelity) hyperparameter search.
 
-This package replaces the flat W&B sweep with a hierarchical search over the full
-routed decision pipeline:  gating strategy, target construction, loss family,
-router and gate architectures, and training policy.
+Hyperband ``budget`` scales router/gate **training epochs** only. Open-rate
+calibration and proxy gain always use the **full** routing-val split.
 
-Gate thresholds are calibrated post-training via open-rate search on routing-val
-(no LLM needed).  Expensive LLM evaluation is reserved for promoted high-budget
-configurations and final confirmation runs.
+This package searches the full routed decision pipeline: gating strategy, target
+construction, loss family, router and gate architectures, and training policy.
 
 Usage::
 

@@ -20,7 +20,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset, random_split
 
-from training.train_fine_router import FineRouter, soft_cross_entropy
+from training.train_fine_router import (
+    FineRouter,
+    soft_cross_entropy,
+    weighted_soft_cross_entropy,
+)
 
 from experiments.unified_hpo.model_factory import (
     FlexibleGateMLP,
@@ -36,7 +40,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_ROUTER_EPOCHS = 100
 DEFAULT_GATE_EPOCHS = 60
 DEFAULT_BATCH_SIZE = 64
-
+#TODO the epochs might be way to long though.. is there nothing adaptive here? Need to add early stopping.
 
 # ---------------------------------------------------------------------------
 # Training result
@@ -78,6 +82,10 @@ class TrainResult:
     num_train_samples: int = 0
     num_val_samples: int = 0
 
+    # Actual epoch counts used (Hyperband scales these; defaults match base constants)
+    router_epochs_used: int = DEFAULT_ROUTER_EPOCHS
+    gate_epochs_used: int = DEFAULT_GATE_EPOCHS
+
 
 # ---------------------------------------------------------------------------
 # Internal training helpers
@@ -94,7 +102,7 @@ def _train_router_model(
     epochs: int,
     device: torch.device,
 ) -> Tuple[FineRouter, float]:
-    """Train the router with early stopping on val loss.  Returns (model, best_val_loss)."""
+    """Train router for ``epochs``; keep weights with best val loss.  Returns (model, best_val_loss)."""
     optimizer = torch.optim.AdamW(router.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
@@ -435,7 +443,17 @@ def train_and_summarize(
     else:
         train_Y = torch.stack([targets[i] for i in train_idx])
         val_Y = torch.stack([targets[i] for i in val_idx])
-        loss_fn = soft_cross_entropy
+        use_class_weights = config.get("inverse_freq_class_weights", True)
+        if use_class_weights:
+            mass = train_Y.sum(dim=0).float().clamp(min=1.0)
+            class_weights = (1.0 / mass)
+            class_weights = class_weights / class_weights.mean()
+            class_weights = class_weights.to(device)
+
+            def loss_fn(logits, y):
+                return weighted_soft_cross_entropy(logits, y, class_weights)
+        else:
+            loss_fn = soft_cross_entropy
 
     train_ds = TensorDataset(train_X, train_Y)
     val_ds = TensorDataset(val_X, val_Y)
@@ -448,6 +466,9 @@ def train_and_summarize(
     router = build_router(d_model, num_classes, config).to(device)
     router_lr = float(config.get("router_lr", 1e-3))
     router_wd = float(config.get("router_weight_decay", 0.01))
+
+    result.router_epochs_used = router_epochs
+    result.gate_epochs_used = gate_epochs
 
     router, router_val_loss = _train_router_model(
         router, train_loader, val_loader, val_size,

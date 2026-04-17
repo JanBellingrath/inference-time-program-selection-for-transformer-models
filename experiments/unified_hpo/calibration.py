@@ -5,10 +5,10 @@ After a router and gate are trained, this module:
 1. Computes a scalar routing score per routing-val sample.
 2. Computes the proxy delta for each sample (what gain the router's predicted
    route would yield, looked up from the explored data).
-3. Sorts by score descending and uses cumulative-prefix sums to evaluate the
-   proxy gain at any open rate in O(1).
-4. Runs a tiny local search around a prior-predicted center to find the
-   best open rate.
+3. Sorts by score descending and uses cumulative-prefix sums so the mean
+   proxy gain for ``open top-k by score`` is one vectorized divide.
+4. Picks the best ``k`` (equivalently realized open rate ``k/N``) by
+   ``argmax`` over feasible ``k``, without a learned prior.
 
 This replaces the old approach of searching ``gamma`` / ``confidence_threshold``
 / ``delta_margin`` as global hyperparameters.
@@ -17,11 +17,11 @@ This replaces the old approach of searching ``gamma`` / ``confidence_threshold``
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import torch
-import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,6 @@ class CalibrationResult:
     best_threshold: float = 0.0
     best_gain: float = 0.0
     realized_open_fraction: float = 0.0
-    prior_center: float = 0.0
     candidates_tested: List[Tuple[float, float]] = field(default_factory=list)
 
 
@@ -92,12 +91,7 @@ def compute_per_sample_deltas_from_best_delta(
     records: List[Dict],
     val_indices: List[int],
 ) -> torch.Tensor:
-    """Simpler fallback: if the router routes (pred != 0), use ``best_delta``.
-
-    This is an upper-bound proxy (assumes the router always picks the optimal
-    route when it does route).  Useful when explored data is sparse or when
-    the catalog mapping is ambiguous.
-    """
+    """Oracle upper bound: if pred != 0, use ``best_delta`` for that record."""
     deltas = torch.zeros(len(val_indices), dtype=torch.float32)
     for i, vi in enumerate(val_indices):
         if int(router_preds[i].item()) != 0:
@@ -111,7 +105,7 @@ def compute_per_sample_deltas_from_best_delta(
 
 @dataclass
 class _PrefixIndex:
-    """Precomputed structure for O(1) gain evaluation at any open rate."""
+    """Precomputed structure: scores sorted desc, prefix sums of deltas."""
     sorted_scores: torch.Tensor
     cumsum_deltas: torch.Tensor
     n: int
@@ -129,34 +123,15 @@ def _build_prefix_index(
     return _PrefixIndex(sorted_scores=sorted_scores, cumsum_deltas=cumsum, n=len(scores))
 
 
-def _eval_gain_at_rho(prefix: _PrefixIndex, rho: float) -> Tuple[float, float, float]:
-    """Evaluate proxy gain at open rate ``rho``.
-
-    Returns ``(gain, threshold, realized_fraction)`` where:
-    - gain is the average delta over the top-rho fraction
-    - threshold is the score at the rho boundary
-    - realized_fraction is the actual fraction opened (may differ slightly
-      from rho due to discrete sample counts)
-    """
-    k = max(1, min(prefix.n, int(rho * prefix.n)))
-    gain = float(prefix.cumsum_deltas[k - 1].item()) / prefix.n
-    threshold = float(prefix.sorted_scores[k - 1].item())
-    realized = k / prefix.n
-    return gain, threshold, realized
-
-
-# ---------------------------------------------------------------------------
-# Open-rate calibration
-# ---------------------------------------------------------------------------
-
 def calibrate_open_rate(
     scores: torch.Tensor,
     deltas: torch.Tensor,
-    prior_center: float = 0.10,
-    prior_sigma: float = 0.15,
-    n_samples: Optional[int] = None,
 ) -> CalibrationResult:
-    """Run the local open-rate search around a prior-predicted center.
+    """Pick ``k`` that maximizes mean proxy gain (top-``k`` by score).
+
+    Only considers realized open rates ``k/N`` in ``[RHO_MIN, RHO_MAX]`` when
+    that range is non-empty in discrete ``k``; otherwise maximizes over all
+    ``k`` in ``1..N``.
 
     Parameters
     ----------
@@ -164,83 +139,54 @@ def calibrate_open_rate(
         Routing scores for each routing-val sample (higher = more likely to route).
     deltas : Tensor [N]
         Proxy delta for each sample (gain from routing, looked up from data).
-    prior_center : float
-        Prior-predicted best open rate (from the threshold prior).
-    prior_sigma : float
-        Uncertainty of the prior prediction.
-    n_samples : int or None
-        If set, use only the first ``n_samples`` samples (budget subsampling).
 
     Returns
     -------
     CalibrationResult
     """
-    if n_samples is not None and n_samples < len(scores):
-        scores = scores[:n_samples]
-        deltas = deltas[:n_samples]
-
-    if len(scores) < 2:
-        return CalibrationResult(best_rho=prior_center, prior_center=prior_center)
+    scores = scores.detach().float().cpu().reshape(-1)
+    deltas = deltas.detach().float().cpu().reshape(-1)
+    if scores.numel() != deltas.numel():
+        raise ValueError("scores and deltas must have the same length")
+    n = int(scores.numel())
+    if n == 0:
+        return CalibrationResult()
 
     prefix = _build_prefix_index(scores, deltas)
-    result = CalibrationResult(prior_center=prior_center)
+    mean_gains = prefix.cumsum_deltas / float(n)
 
-    # Build candidate set: center +/- step sizes
-    step1 = max(0.02, min(0.05, prior_sigma * 0.3))
-    step2 = step1 * 2.0
+    k_min = max(1, int(math.ceil(n * RHO_MIN - 1e-12)))
+    k_max = min(n, max(k_min, int(n * RHO_MAX)))
 
-    candidates = sorted(set([
-        max(RHO_MIN, min(RHO_MAX, prior_center)),
-        max(RHO_MIN, min(RHO_MAX, prior_center - step1)),
-        max(RHO_MIN, min(RHO_MAX, prior_center + step1)),
-        max(RHO_MIN, min(RHO_MAX, prior_center - step2)),
-        max(RHO_MIN, min(RHO_MAX, prior_center + step2)),
-    ]))
+    if k_min > k_max:
+        best_idx = int(mean_gains.argmax().item())
+    else:
+        segment = mean_gains[k_min - 1 : k_max]
+        rel = int(segment.argmax().item())
+        best_idx = (k_min - 1) + rel
 
-    best_gain = -float("inf")
-    best_rho = prior_center
-    best_threshold = 0.0
-    best_realized = 0.0
+    best_k = best_idx + 1
+    best_gain = float(mean_gains[best_idx].item())
+    realized = best_k / float(n)
+    threshold = float(prefix.sorted_scores[best_idx].item())
 
-    for rho in candidates:
-        gain, threshold, realized = _eval_gain_at_rho(prefix, rho)
-        result.candidates_tested.append((rho, gain))
-        if gain > best_gain:
-            best_gain = gain
-            best_rho = rho
-            best_threshold = threshold
-            best_realized = realized
-
-    # Greedy refinement: if the best is at an edge, probe further in that direction
-    if best_rho == max(candidates) and best_rho + step1 <= RHO_MAX:
-        probe = best_rho + step1
-        gain, threshold, realized = _eval_gain_at_rho(prefix, probe)
-        result.candidates_tested.append((probe, gain))
-        if gain > best_gain:
-            best_gain = gain
-            best_rho = probe
-            best_threshold = threshold
-            best_realized = realized
-    elif best_rho == min(candidates) and best_rho - step1 >= RHO_MIN:
-        probe = best_rho - step1
-        gain, threshold, realized = _eval_gain_at_rho(prefix, probe)
-        result.candidates_tested.append((probe, gain))
-        if gain > best_gain:
-            best_gain = gain
-            best_rho = probe
-            best_threshold = threshold
-            best_realized = realized
-
-    result.best_rho = best_rho
-    result.best_threshold = best_threshold
-    result.best_gain = best_gain
-    result.realized_open_fraction = best_realized
+    result = CalibrationResult(
+        best_rho=realized,
+        best_threshold=threshold,
+        best_gain=best_gain,
+        realized_open_fraction=realized,
+        candidates_tested=[(realized, best_gain)],
+    )
 
     logger.info(
         "Calibration: best_rho=%.3f  threshold=%.4f  gain=%.5f  "
-        "realized_open=%.3f  (%d candidates tested on %d samples)",
-        best_rho, best_threshold, best_gain, best_realized,
-        len(result.candidates_tested), len(scores),
+        "realized_open=%.3f  (N=%d  k=%d)",
+        result.best_rho,
+        result.best_threshold,
+        result.best_gain,
+        result.realized_open_fraction,
+        n,
+        best_k,
     )
 
     return result

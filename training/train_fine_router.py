@@ -695,6 +695,22 @@ def soft_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Ten
     return -(targets * log_probs).sum(dim=-1).mean()
 
 
+def weighted_soft_cross_entropy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    class_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Soft cross-entropy with per-class weights on the decomposition.
+
+    Per sample: ``sum_c w_c * (-target_c * log_softmax_c)``, mean over batch.
+    ``class_weights`` is ``[num_classes]``, same normalization as inverse-frequency
+    hard CE (typically mean weight 1).
+    """
+    log_probs = F.log_softmax(logits, dim=-1)
+    w = class_weights.to(device=logits.device, dtype=logits.dtype)
+    return -(targets * log_probs * w.unsqueeze(0)).sum(dim=-1).mean()
+
+
 def _enumerated_delta_split_metrics(
     model: nn.Module,
     ds: EnumeratedDeviationDataset,

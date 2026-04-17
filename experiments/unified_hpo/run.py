@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""CLI entrypoint for the unified SMAC + Hyperband HPO.
+"""CLI entrypoint for the unified SMAC HPO.
 
-Loads routing data once, sets up SMAC with the Hyperband intensifier, and
-launches the optimization.  Optionally runs post-HPO confirmation on the
-top-K configurations.
+Loads routing data once, sets up SMAC with ``MultiFidelityFacade`` (Hyperband
+**training** budgets: scaled router/gate epochs). Calibration always uses the
+full routing-val split.  Optionally runs post-HPO confirmation on the top-K
+configurations.
 
 Usage::
 
@@ -17,8 +18,9 @@ Usage::
         --output_dir hpo_results/winogrande \\
         --seed 42
 
-The LLM is NOT loaded at startup.  It is loaded lazily only if expensive
-evaluation is triggered at the highest budget.
+The LLM is NOT loaded at startup.  It is loaded lazily only when
+``--enable_expensive_eval`` is set **and** the trial runs at the maximum
+training budget.
 """
 
 from __future__ import annotations
@@ -263,19 +265,20 @@ def _run_confirmation(
     seeds: List[int] = (42, 123, 456),
 ) -> None:
     """Retrain and evaluate the top-K configurations on multiple seeds."""
-    from experiments.unified_hpo.threshold_prior import ThresholdPriorArchive, ThresholdPrior
+    from experiments.unified_hpo.threshold_prior import ThresholdPriorArchive
     from experiments.unified_hpo.trainer import train_and_summarize
-    from experiments.unified_hpo.budgeted_evaluator import evaluate_configuration, DEFAULT_MAX_BUDGET
+    from experiments.unified_hpo.budgeted_evaluator import evaluate_configuration
 
     import wandb
 
     archive = ThresholdPriorArchive(archive_path)
-    prior = ThresholdPrior(archive)
 
-    # Find top-K by proxy gain at highest budget
+    # Top-K by proxy gain: prefer max training-budget runs; include legacy archives (budget≈1)
+    mb = float(getattr(args, "max_budget", 243.0))
     high_budget_records = [
         r for r in archive.records
-        if r.budget >= DEFAULT_MAX_BUDGET * 0.9 and r.proxy_gain > -0.5
+        if r.proxy_gain > -0.5
+        and (float(r.budget) >= mb * 0.9 or abs(float(r.budget) - 1.0) < 0.02)
     ]
     high_budget_records.sort(key=lambda r: r.proxy_gain, reverse=True)
     top_configs = []
@@ -286,7 +289,7 @@ def _run_confirmation(
             seen_hashes.add(rec.config_hash)
 
     if not top_configs:
-        logger.warning("No high-budget records found for confirmation.")
+        logger.warning("No valid archive records found for confirmation.")
         return
 
     logger.info("Confirming top-%d configurations on seeds %s", len(top_configs), seeds)
@@ -316,9 +319,6 @@ def _run_confirmation(
                 records=data["records"],
                 sequence_catalog=data["sequence_catalog"],
                 seq_to_idx=data["seq_to_idx"],
-                budget=DEFAULT_MAX_BUDGET,
-                max_budget=DEFAULT_MAX_BUDGET,
-                prior=prior,
                 enable_expensive_eval=args.enable_expensive_eval,
                 expensive_eval_fn=expensive_eval_fn,
             )
@@ -369,7 +369,7 @@ def _run_confirmation(
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Unified SMAC + Hyperband HPO for single-benchmark fine routers",
+        description="Unified SMAC + Hyperband (training epochs) for fine routers",
     )
     p.add_argument("--data_dir", type=str, required=True,
                    help="Dir with {bench}_pivot_residuals.pt and {bench}.jsonl")
@@ -384,10 +384,14 @@ def parse_args():
     p.add_argument("--wandb_run_name", type=str, default=None)
     p.add_argument("--n_trials", type=int, default=100,
                    help="Maximum number of SMAC trials")
-    p.add_argument("--min_budget", type=float, default=64,
-                   help="Hyperband minimum budget (routing-val subset size)")
-    p.add_argument("--max_budget", type=float, default=576,
-                   help="Hyperband maximum budget (routing-val subset size)")
+    p.add_argument(
+        "--min_budget", type=float, default=9.0,
+        help="Minimum Hyperband training budget (maps to fewer router/gate epochs)",
+    )
+    p.add_argument(
+        "--max_budget", type=float, default=243.0,
+        help="Maximum Hyperband training budget (full epoch counts)",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--walltime_limit", type=float, default=float("inf"),
@@ -395,7 +399,7 @@ def parse_args():
 
     # Expensive evaluation
     p.add_argument("--enable_expensive_eval", action="store_true",
-                   help="Run LLM-based evaluation at the highest budget")
+                   help="Run LLM eval only on trials at --max_budget (costly)")
     p.add_argument("--eval_questions", type=int, default=200,
                    help="Number of validation questions for expensive eval")
 

@@ -92,32 +92,32 @@ def build_configspace() -> ConfigurationSpace:
 
     # === Router architecture ===============================================
 
-    router_depth = Categorical("router_depth", items=[1, 2, 3], default=2)
-    router_width = Categorical("router_width", items=[128, 256, 512], default=256)
+    router_depth = Categorical("router_depth", items=[1, 2, 3, 4, 5], default=3)
+    router_width = Categorical("router_width", items=[128, 256, 512, 1024, 2048], default=512)
     router_shrink = Categorical(
-        "router_shrink", items=[1.0, 0.75, 0.5], default=0.75,
+        "router_shrink", items=[1.0, 0.75, 0.5, 0.25], default=0.75,
     )
-    router_dropout = Float("router_dropout", bounds=(0.0, 0.30), default=0.10)
-    router_lr = Float("router_lr", bounds=(2e-4, 5e-3), default=1e-3, log=True)
+    router_dropout = Float("router_dropout", bounds=(0.0, 0.50), default=0.15)
+    router_lr = Float("router_lr", bounds=(1e-4, 5e-3), default=1e-3, log=True)
     router_wd = Float(
-        "router_weight_decay", bounds=(1e-5, 3e-2), default=1e-2, log=True,
+        "router_weight_decay", bounds=(1e-5, 10e-2), default=1e-2, log=True,
     )
 
     cs.add([router_depth, router_width, router_shrink,
             router_dropout, router_lr, router_wd])
 
     # router_shrink is only active when depth > 1
-    cs.add(InCondition(router_shrink, router_depth, [2, 3]))
+    cs.add(InCondition(router_shrink, router_depth, [2, 3, 4, 5]))
 
     # === Gate / delta-gate architecture ====================================
     # Active only when gating_mode in {gate_network, delta_gate}.
 
-    gate_depth = Categorical("gate_depth", items=[1, 2, 3], default=2)
-    gate_width = Categorical("gate_width", items=[64, 128, 256], default=128)
-    gate_shrink = Categorical("gate_shrink", items=[1.0, 0.75, 0.5], default=0.75)
-    gate_dropout = Float("gate_dropout", bounds=(0.0, 0.30), default=0.10)
-    gate_lr = Float("gate_lr", bounds=(1e-4, 3e-3), default=5e-4, log=True)
-    gate_wd = Float("gate_weight_decay", bounds=(1e-5, 1e-2), default=1e-3, log=True)
+    gate_depth = Categorical("gate_depth", items=[1, 2, 3, 4, 5], default=2)
+    gate_width = Categorical("gate_width", items=[64, 128, 256, 512, 1024], default=128)
+    gate_shrink = Categorical("gate_shrink", items=[1.0, 0.75, 0.5, 0.25], default=0.75)
+    gate_dropout = Float("gate_dropout", bounds=(0.0, 0.50), default=0.15)
+    gate_lr = Float("gate_lr", bounds=(1e-4, 1e-3), default=1e-4, log=True)
+    gate_wd = Float("gate_weight_decay", bounds=(1e-5, 5e-2), default=5e-3, log=True)
     gate_cost_scale = Float(
         "gate_cost_scale", bounds=(0.75, 3.0), default=1.5, log=True,
     )
@@ -134,7 +134,7 @@ def build_configspace() -> ConfigurationSpace:
     # gate_shrink requires BOTH gating_mode in {gate_network, delta_gate} AND gate_depth > 1
     cs.add(AndConjunction(
         InCondition(gate_shrink, gating_mode, ["gate_network", "delta_gate"]),
-        InCondition(gate_shrink, gate_depth, [2, 3]),
+        InCondition(gate_shrink, gate_depth, [2, 3, 4, 5]),
     ))
 
     # === Target construction (explored branch only) ========================
@@ -155,7 +155,6 @@ def build_configspace() -> ConfigurationSpace:
 
     cs.add([label_smoothing, inv_freq])
     cs.add(EqualsCondition(label_smoothing, router_loss, "hard_ce"))
-    cs.add(EqualsCondition(inv_freq, router_loss, "hard_ce"))
 
     top_k = Categorical("top_k", items=[2, 4, 8, 16], default=4)
     cs.add(top_k)

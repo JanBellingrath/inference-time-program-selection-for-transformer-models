@@ -1,11 +1,9 @@
 """SMAC + Hyperband orchestration, W&B logging, and best-model persistence.
 
-This is the main module that wires together all components of the unified HPO:
-
-- Defines the SMAC target function (train -> calibrate -> evaluate).
-- Sets up SMAC with the Hyperband intensifier.
-- Logs every trial to W&B in detail (parallel coordinates, score distributions, etc.).
-- Automatically saves the best routing system found so far.
+- **Training fidelity** (Hyperband ``budget``): scales router/gate epoch counts;
+  cheap low-budget runs prune the search space.
+- **Evaluation**: always full routing-val for calibration / proxy gain (no eval subsampling).
+- Checkpoints and optional expensive LLM eval run only at **maximum** training budget.
 """
 
 from __future__ import annotations
@@ -24,19 +22,19 @@ import numpy as np
 
 import wandb
 
-from experiments.unified_hpo.budgeted_evaluator import (
-    DEFAULT_MAX_BUDGET,
-    DEFAULT_MIN_BUDGET,
-    EvalResult,
-    evaluate_configuration,
-)
+from experiments.unified_hpo.budgeted_evaluator import EvalResult, evaluate_configuration
 from experiments.unified_hpo.calibration import CalibrationResult
 from experiments.unified_hpo.search_space import build_configspace, config_to_dict
 from experiments.unified_hpo.threshold_prior import (
     ArchiveRecord,
-    ThresholdPrior,
     ThresholdPriorArchive,
     _config_hash,
+)
+from experiments.unified_hpo.training_budget import (
+    DEFAULT_TRAIN_MAX_BUDGET,
+    DEFAULT_TRAIN_MIN_BUDGET,
+    is_full_training_budget,
+    router_gate_epochs_from_training_budget,
 )
 from experiments.unified_hpo.trainer import TrainResult, train_and_summarize
 
@@ -151,10 +149,10 @@ def _log_trial_to_wandb(
     config: Dict,
     train_result: TrainResult,
     eval_result: EvalResult,
-    budget: float,
     trial_idx: int,
     wall_time: float,
     is_new_best: bool,
+    training_budget: float,
 ) -> None:
     """Log comprehensive metrics for a single trial to the active W&B run."""
     gating_mode = config.get("gating_mode", "?")
@@ -164,7 +162,9 @@ def _log_trial_to_wandb(
     log_dict: Dict[str, Any] = {
         # Branch identifiers
         "trial_idx": trial_idx,
-        "budget": budget,
+        "training_budget": training_budget,
+        "router_epochs_used": train_result.router_epochs_used,
+        "gate_epochs_used": train_result.gate_epochs_used,
         "gating_mode": gating_mode,
         "target_source": target_source,
         "router_loss": router_loss,
@@ -191,7 +191,6 @@ def _log_trial_to_wandb(
         **{f"score_{k}": v for k, v in train_result.score_quantiles.items()},
 
         # Calibration
-        "prior_center_rho": eval_result.calibration.prior_center,
         "best_rho": eval_result.calibration.best_rho,
         "best_threshold": eval_result.calibration.best_threshold,
         "realized_open_fraction": eval_result.calibration.realized_open_fraction,
@@ -299,22 +298,17 @@ def build_target_function(
     device: torch.device,
     benchmark: str,
     archive: ThresholdPriorArchive,
-    prior: ThresholdPrior,
     tracker: BestModelTracker,
-    max_budget: float = DEFAULT_MAX_BUDGET,
+    min_budget: float,
+    max_budget: float,
     enable_expensive_eval: bool = False,
     expensive_eval_fn: Optional[Callable] = None,
     wandb_run=None,
     seed: int = 42,
 ) -> Callable:
-    """Build the target function that SMAC calls for each (config, seed, budget).
+    """Build the SMAC target (train at budget → full-val calibration → cost).
 
-    The target function:
-    1. Trains router + gate/delta-gate.
-    2. Calibrates open rate on routing-val.
-    3. Returns negated proxy gain (SMAC minimizes).
-
-    All per-trial logging and archive updates happen inside this function.
+    ``budget`` scales **training epochs only**; calibration always uses all routing-val rows.
     """
     trial_counter = [0]
 
@@ -325,15 +319,20 @@ def build_target_function(
         trial_counter[0] += 1
         run_id = str(uuid.uuid4())[:12]
 
-        cfg = config_to_dict(config)
-        logger.info(
-            "=== Trial %d  budget=%.0f  gating=%s  target=%s  loss=%s ===",
-            trial_idx, budget,
-            cfg.get("gating_mode"), cfg.get("target_source"), cfg.get("router_loss"),
+        router_e, gate_e = router_gate_epochs_from_training_budget(
+            budget, min_budget, max_budget,
         )
 
         try:
-            # --- Train ---
+            cfg = config_to_dict(config)
+            logger.info(
+                "=== Trial %d  train_budget=%.1f  router_ep=%d  gate_ep=%d  "
+                "gating=%s  target=%s  loss=%s ===",
+                trial_idx, budget, router_e, gate_e,
+                cfg.get("gating_mode"), cfg.get("target_source"), cfg.get("router_loss"),
+            )
+
+            # --- Train (fidelity from Hyperband budget) ---
             train_result = train_and_summarize(
                 config=cfg,
                 residuals=residuals,
@@ -345,42 +344,48 @@ def build_target_function(
                 d_model=d_model,
                 device=device,
                 seed=seed,
+                router_epochs=router_e,
+                gate_epochs=gate_e,
             )
 
-            # --- Evaluate ---
+            full_train = is_full_training_budget(budget, max_budget)
+            run_expensive = bool(
+                enable_expensive_eval and full_train and expensive_eval_fn is not None,
+            )
+
+            # --- Evaluate (always full routing-val; no subsampling) ---
             eval_result = evaluate_configuration(
                 train_result=train_result,
                 config=cfg,
                 records=records,
                 sequence_catalog=sequence_catalog,
                 seq_to_idx=seq_to_idx,
-                budget=budget,
-                max_budget=max_budget,
-                prior=prior,
-                enable_expensive_eval=enable_expensive_eval,
+                enable_expensive_eval=run_expensive,
                 expensive_eval_fn=expensive_eval_fn,
             )
 
             proxy_gain = eval_result.proxy_gain
             wall_time = time.time() - t0
 
-            # --- Best model tracking ---
+            # --- Best model tracking (only at max training budget) ---
             expensive_gain = None
             if eval_result.expensive_metrics is not None:
                 expensive_gain = eval_result.expensive_metrics.get("unconditional_gain")
-            is_new_best = tracker.maybe_save(
-                proxy_gain=proxy_gain,
-                train_result=train_result,
-                config=cfg,
-                calibration=eval_result.calibration,
-                expensive_gain=expensive_gain,
-                wandb_run=wandb_run,
-            )
+            is_new_best = False
+            if full_train:
+                is_new_best = tracker.maybe_save(
+                    proxy_gain=proxy_gain,
+                    train_result=train_result,
+                    config=cfg,
+                    calibration=eval_result.calibration,
+                    expensive_gain=expensive_gain,
+                    wandb_run=wandb_run,
+                )
 
             # --- W&B logging ---
             _log_trial_to_wandb(
                 cfg, train_result, eval_result,
-                budget, trial_idx, wall_time, is_new_best,
+                trial_idx, wall_time, is_new_best, budget,
             )
 
             # --- Archive update ---
@@ -389,7 +394,7 @@ def build_target_function(
                 timestamp=time.time(),
                 benchmark=benchmark,
                 seed=seed,
-                budget=budget,
+                budget=float(budget),
                 config_hash=_config_hash(cfg),
                 config=cfg,
                 gating_mode=cfg.get("gating_mode", ""),
@@ -406,7 +411,7 @@ def build_target_function(
                 score_quantiles=train_result.score_quantiles,
                 router_entropy_mean=train_result.router_entropy_mean,
                 frac_router_argmax_noop=train_result.predicted_noop_rate,
-                prior_predicted_rho=eval_result.calibration.prior_center,
+                prior_predicted_rho=0.0,
                 candidates_tested=eval_result.calibration.candidates_tested,
                 best_rho=eval_result.calibration.best_rho,
                 best_threshold=eval_result.calibration.best_threshold,
@@ -424,9 +429,9 @@ def build_target_function(
 
             logger.info(
                 "Trial %d done: proxy_gain=%.5f  rho=%.3f  "
-                "router_loss=%.4f  budget=%.0f  (%.1fs)%s",
+                "router_loss=%.4f  (%.1fs)%s",
                 trial_idx, proxy_gain, eval_result.calibration.best_rho,
-                train_result.router_val_loss, budget, wall_time,
+                train_result.router_val_loss, wall_time,
                 "  *** NEW BEST ***" if is_new_best else "",
             )
 
@@ -436,18 +441,23 @@ def build_target_function(
         except Exception as e:
             logger.error("Trial %d FAILED: %s", trial_idx, e, exc_info=True)
 
-            # Log failure to archive
+            fail_cfg: Dict[str, Any] = {}
+            try:
+                fail_cfg = config_to_dict(config)
+            except Exception:
+                pass
+
             archive.append(ArchiveRecord(
                 run_id=run_id,
                 timestamp=time.time(),
                 benchmark=benchmark,
                 seed=seed,
-                budget=budget,
-                config_hash=_config_hash(cfg),
-                config=cfg,
-                gating_mode=cfg.get("gating_mode", ""),
-                target_source=cfg.get("target_source", ""),
-                router_loss=cfg.get("router_loss", ""),
+                budget=float(budget),
+                config_hash=_config_hash(fail_cfg),
+                config=fail_cfg,
+                gating_mode=fail_cfg.get("gating_mode", ""),
+                target_source=fail_cfg.get("target_source", ""),
+                router_loss=fail_cfg.get("router_loss", ""),
                 objective_returned=FAILURE_COST,
                 proxy_gain=-FAILURE_COST,
             ))
@@ -455,7 +465,6 @@ def build_target_function(
             # Log failure to W&B
             wandb.log({
                 "trial_idx": trial_idx,
-                "budget": budget,
                 "proxy_gain": -FAILURE_COST,
                 "failed": True,
                 "error": str(e),
@@ -485,14 +494,14 @@ def run_smac_optimization(
     wandb_project: str,
     wandb_run_name: Optional[str] = None,
     n_trials: int = 100,
-    min_budget: float = DEFAULT_MIN_BUDGET,
-    max_budget: float = DEFAULT_MAX_BUDGET,
+    min_budget: float = DEFAULT_TRAIN_MIN_BUDGET,
+    max_budget: float = DEFAULT_TRAIN_MAX_BUDGET,
     enable_expensive_eval: bool = False,
     expensive_eval_fn: Optional[Callable] = None,
     seed: int = 42,
     walltime_limit: float = float("inf"),
 ) -> ThresholdPriorArchive:
-    """Set up and run the full SMAC + Hyperband optimization.
+    """Set up and run SMAC with Hyperband training fidelity (epoch scaling).
 
     Returns the populated archive after optimization completes.
     """
@@ -502,7 +511,6 @@ def run_smac_optimization(
     os.makedirs(output_dir, exist_ok=True)
     archive_path = os.path.join(output_dir, "threshold_prior_archive.jsonl")
     archive = ThresholdPriorArchive(archive_path)
-    prior = ThresholdPrior(archive)
     tracker = BestModelTracker(output_dir, benchmark)
 
     cs = build_configspace()
@@ -514,14 +522,14 @@ def run_smac_optimization(
         config={
             "benchmark": benchmark,
             "n_trials": n_trials,
-            "min_budget": min_budget,
-            "max_budget": max_budget,
+            "min_training_budget": min_budget,
+            "max_training_budget": max_budget,
             "seed": seed,
             "d_model": d_model,
             "num_classes": num_classes,
             "n_samples": len(gate_labels),
         },
-        tags=[benchmark, "unified-hpo", "smac-hyperband"],
+        tags=[benchmark, "unified-hpo", "smac-hyperband-train"],
     )
 
     # --- Build target function ---
@@ -537,8 +545,8 @@ def run_smac_optimization(
         device=device,
         benchmark=benchmark,
         archive=archive,
-        prior=prior,
         tracker=tracker,
+        min_budget=min_budget,
         max_budget=max_budget,
         enable_expensive_eval=enable_expensive_eval,
         expensive_eval_fn=expensive_eval_fn,
@@ -559,7 +567,6 @@ def run_smac_optimization(
         deterministic=True,
     )
 
-    # --- Launch SMAC with MultiFidelityFacade (uses Hyperband intensifier) ---
     smac = MultiFidelityFacade(
         scenario=scenario,
         target_function=target_fn,
@@ -568,7 +575,7 @@ def run_smac_optimization(
     )
 
     logger.info(
-        "Starting SMAC optimization: n_trials=%d  budget=[%.0f, %.0f]  "
+        "Starting SMAC optimization: n_trials=%d  train_budget=[%.1f, %.1f]  "
         "benchmark=%s  seed=%d",
         n_trials, min_budget, max_budget, benchmark, seed,
     )

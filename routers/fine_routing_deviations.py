@@ -10,12 +10,19 @@ It is represented as a tuple of ``Edit`` objects, each describing one atomic
 change to the position-indexed sequence (length == num_layers, with -1 for
 SKIP).  ``apply_deviation`` turns an anchor + deviation into a new sequence
 that can be passed through ``seq_to_layers`` for execution.
+
+This module is the *legacy* surface; the canonical edit DSL lives in
+:mod:`core.edit_dsl` (which uses the user-spec ``repeat(i)`` convention,
+where the argument is the source position rather than the destination).
+A compatibility shim in :mod:`core.edit_dsl_compat` translates between the
+two, but the in-tree callers of this module continue to use ``Edit`` with
+its legacy ``repeat(pos)`` (destination-indexed) semantics.
 """
 
 from __future__ import annotations
 
 import itertools
-from typing import Dict, List, NamedTuple, Sequence, Tuple
+from typing import Dict, FrozenSet, List, NamedTuple, Sequence, Tuple
 
 SKIP = -1
 
@@ -140,13 +147,36 @@ def enumerate_single_edits(
     return edits
 
 
+def _edit_support(edit: Edit) -> FrozenSet[int]:
+    """Anchor positions a legacy ``Edit`` *touches*.
+
+    ``repeat(pos)`` reads from ``pos - 1`` and writes to ``pos``, so its
+    support is ``{pos - 1, pos}``.  This matches the support semantics of
+    :func:`core.edit_dsl.support` for the equivalent new-DSL primitive.
+    """
+    if edit.kind == "skip":
+        return frozenset((int(edit.positions[0]),))
+    if edit.kind == "repeat":
+        pos = int(edit.positions[0])
+        return frozenset((pos - 1, pos))
+    if edit.kind == "swap":
+        return frozenset((int(edit.positions[0]), int(edit.positions[1])))
+    raise ValueError(f"Unknown edit kind: {edit.kind}")
+
+
 def _edits_conflict(a: Tuple[Edit, ...], b: Tuple[Edit, ...]) -> bool:
-    """True if two single-edit deviations touch any overlapping position."""
-    positions_a = set()
+    """True if two deviations touch any overlapping anchor position.
+
+    Uses :func:`_edit_support` so that ``repeat(pos)`` correctly reports
+    overlap with ``skip(pos - 1)`` (previously the predecessor read was not
+    counted, allowing 2-edit combos with shared anchor positions to slip
+    through).
+    """
+    supp_a: set = set()
     for e in a:
-        positions_a.update(e.positions)
+        supp_a.update(_edit_support(e))
     for e in b:
-        if positions_a & set(e.positions):
+        if supp_a & _edit_support(e):
             return True
     return False
 

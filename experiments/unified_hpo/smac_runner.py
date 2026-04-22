@@ -24,7 +24,14 @@ import wandb
 
 from experiments.unified_hpo.budgeted_evaluator import EvalResult, evaluate_configuration
 from experiments.unified_hpo.calibration import CalibrationResult
+from experiments.unified_hpo.compositional_objective import (
+    train_and_score_compositional,
+)
 from experiments.unified_hpo.search_space import build_configspace, config_to_dict
+from experiments.unified_hpo.search_space_compositional import (
+    build_configspace_compositional,
+    config_to_dict as compositional_config_to_dict,
+)
 from experiments.unified_hpo.threshold_prior import (
     ArchiveRecord,
     ThresholdPriorArchive,
@@ -52,12 +59,35 @@ FAILURE_COST = 1.0
 class BestModelTracker:
     """Tracks and persists the best routing system found so far."""
 
-    def __init__(self, output_dir: str, benchmark: str):
+    def __init__(self, output_dir: str, benchmark: str, *, resume: bool = False):
         self.output_dir = os.path.join(output_dir, f"best_routing_system_{benchmark}")
         self.benchmark = benchmark
         self.best_proxy_gain: float = -float("inf")
         self.best_expensive_gain: Optional[float] = None
         self.best_config: Optional[Dict] = None
+        if resume:
+            meta_path = os.path.join(self.output_dir, "meta.json")
+            if os.path.isfile(meta_path):
+                try:
+                    with open(meta_path) as f:
+                        meta = json.load(f)
+                    if "proxy_gain" in meta and meta["proxy_gain"] is not None:
+                        self.best_proxy_gain = float(meta["proxy_gain"])
+                    if "expensive_gain" in meta and meta["expensive_gain"] is not None:
+                        self.best_expensive_gain = float(meta["expensive_gain"])
+                    if "config" in meta and meta["config"] is not None:
+                        self.best_config = meta["config"]
+                    logger.info(
+                        "Resumed best-model state from %s  proxy_gain=%.5f",
+                        meta_path, self.best_proxy_gain,
+                    )
+                except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
+                    logger.warning("Could not load meta.json for resume: %s", e)
+            else:
+                logger.info(
+                    "Resume requested but no meta.json at %s; best tracker starts fresh.",
+                    meta_path,
+                )
 
     def maybe_save(
         self,
@@ -287,13 +317,13 @@ def log_sweep_summary(
 # ---------------------------------------------------------------------------
 
 def build_target_function(
-    residuals: torch.Tensor,
-    gate_labels: List[int],
-    records: List[Dict],
-    seq_to_idx: Dict[tuple, int],
-    num_classes: int,
-    best_deltas: List[float],
-    sequence_catalog: List,
+    residuals: Optional[torch.Tensor],
+    gate_labels: Optional[List[int]],
+    records: Optional[List[Dict]],
+    seq_to_idx: Optional[Dict[tuple, int]],
+    num_classes: Optional[int],
+    best_deltas: Optional[List[float]],
+    sequence_catalog: Optional[List],
     d_model: int,
     device: torch.device,
     benchmark: str,
@@ -305,12 +335,24 @@ def build_target_function(
     expensive_eval_fn: Optional[Callable] = None,
     wandb_run=None,
     seed: int = 42,
+    router_kind: str = "fine",
+    compositional_ctx: Optional[Dict[str, Any]] = None,
+    initial_trial_idx: int = 0,
 ) -> Callable:
     """Build the SMAC target (train at budget → full-val calibration → cost).
 
-    ``budget`` scales **training epochs only**; calibration always uses all routing-val rows.
+    ``budget`` scales **training epochs only**; calibration always uses all
+    routing-val rows. When ``router_kind == "compositional"``, the
+    compositional objective is used in place of ``train_and_summarize`` /
+    ``evaluate_configuration``; the rest of the bookkeeping (W&B, archive,
+    best-tracker) is unchanged.
     """
-    trial_counter = [0]
+    if router_kind not in ("fine", "compositional"):
+        raise ValueError(f"unknown router_kind={router_kind!r}")
+    if router_kind == "compositional" and compositional_ctx is None:
+        raise ValueError("router_kind='compositional' requires compositional_ctx")
+
+    trial_counter = [int(initial_trial_idx)]
 
     def target_function(config, seed: int = 0, budget: float = max_budget) -> float:
         """SMAC target function.  Returns cost (lower is better)."""
@@ -324,45 +366,106 @@ def build_target_function(
         )
 
         try:
-            cfg = config_to_dict(config)
-            logger.info(
-                "=== Trial %d  train_budget=%.1f  router_ep=%d  gate_ep=%d  "
-                "gating=%s  target=%s  loss=%s ===",
-                trial_idx, budget, router_e, gate_e,
-                cfg.get("gating_mode"), cfg.get("target_source"), cfg.get("router_loss"),
-            )
+            if router_kind == "fine":
+                cfg = config_to_dict(config)
+            else:
+                cfg = compositional_config_to_dict(config)
 
-            # --- Train (fidelity from Hyperband budget) ---
-            train_result = train_and_summarize(
-                config=cfg,
-                residuals=residuals,
-                gate_labels=gate_labels,
-                records=records,
-                seq_to_idx=seq_to_idx,
-                num_classes=num_classes,
-                best_deltas=best_deltas,
-                d_model=d_model,
-                device=device,
-                seed=seed,
-                router_epochs=router_e,
-                gate_epochs=gate_e,
-            )
+            # Per-trial heartbeat: visible in W&B while train_one_router is running.
+            if wandb_run is not None:
+                try:
+                    # Use global wandb.log so the active run (SMAC’s thread) always matches.
+                    wandb.log(
+                        {
+                            "trial/idx": float(trial_idx),
+                            "trial/budget": float(budget),
+                            "trial/router_epochs": float(router_e),
+                            "trial/phase": 0.0,  # 0=train started; 1=done in full metrics
+                        },
+                    )
+                except Exception as e:
+                    logger.warning("trial-start wandb log failed: %s", e)
 
-            full_train = is_full_training_budget(budget, max_budget)
-            run_expensive = bool(
-                enable_expensive_eval and full_train and expensive_eval_fn is not None,
-            )
+            if router_kind == "fine":
+                logger.info(
+                    "=== Trial %d  train_budget=%.1f  router_ep=%d  gate_ep=%d  "
+                    "gating=%s  target=%s  loss=%s ===",
+                    trial_idx, budget, router_e, gate_e,
+                    cfg.get("gating_mode"), cfg.get("target_source"), cfg.get("router_loss"),
+                )
 
-            # --- Evaluate (always full routing-val; no subsampling) ---
-            eval_result = evaluate_configuration(
-                train_result=train_result,
-                config=cfg,
-                records=records,
-                sequence_catalog=sequence_catalog,
-                seq_to_idx=seq_to_idx,
-                enable_expensive_eval=run_expensive,
-                expensive_eval_fn=expensive_eval_fn,
-            )
+                train_result = train_and_summarize(
+                    config=cfg,
+                    residuals=residuals,
+                    gate_labels=gate_labels,
+                    records=records,
+                    seq_to_idx=seq_to_idx,
+                    num_classes=num_classes,
+                    best_deltas=best_deltas,
+                    d_model=d_model,
+                    device=device,
+                    seed=seed,
+                    router_epochs=router_e,
+                    gate_epochs=gate_e,
+                )
+
+                full_train = is_full_training_budget(budget, max_budget)
+                run_expensive = bool(
+                    enable_expensive_eval and full_train and expensive_eval_fn is not None,
+                )
+
+                eval_result = evaluate_configuration(
+                    train_result=train_result,
+                    config=cfg,
+                    records=records,
+                    sequence_catalog=sequence_catalog,
+                    seq_to_idx=seq_to_idx,
+                    enable_expensive_eval=run_expensive,
+                    expensive_eval_fn=expensive_eval_fn,
+                )
+            else:
+                ctx = compositional_ctx or {}
+                logger.info(
+                    "=== Trial %d  train_budget=%.1f  router_ep=%d  "
+                    "kind=compositional scope=%s benchmarks=%s use_pairs=%s ===",
+                    trial_idx, budget, router_e,
+                    ctx.get("scope"), ctx.get("benchmarks"), cfg.get("use_pairs"),
+                )
+
+                train_result = train_and_score_compositional(
+                    config=cfg,
+                    artifacts=ctx["artifacts"],
+                    benchmarks=ctx["benchmarks"],
+                    dense_paths=ctx.get("dense_paths") or {},
+                    scope=ctx.get("scope", "single"),
+                    router_epochs=router_e,
+                    batch_size=int(ctx.get("batch_size", 64)),
+                    val_fraction=float(ctx.get("val_fraction", 0.15)),
+                    seed=seed,
+                    device=device,
+                    objective_metric=ctx.get("objective_metric", "mean_uplift"),
+                    use_full_sequence=bool(ctx.get("use_full_sequence", False)),
+                    wandb_run=wandb_run,
+                    wandb_prefix="compositional/",
+                    use_dense_supervision=None,
+                    downstream_eval_every=0,
+                )
+
+                full_train = is_full_training_budget(budget, max_budget)
+                proxy = float(getattr(train_result, "compositional_proxy", 0.0))
+                eval_result = EvalResult(
+                    calibration=CalibrationResult(
+                        best_rho=0.0,
+                        best_threshold=0.0,
+                        best_gain=proxy,
+                        realized_open_fraction=0.0,
+                        candidates_tested=[(0.0, proxy)],
+                    ),
+                    proxy_gain=proxy,
+                    oracle_proxy_gain=proxy,
+                    routing_val_size_used=0,
+                    ran_expensive_eval=False,
+                )
 
             proxy_gain = eval_result.proxy_gain
             wall_time = time.time() - t0
@@ -443,7 +546,11 @@ def build_target_function(
 
             fail_cfg: Dict[str, Any] = {}
             try:
-                fail_cfg = config_to_dict(config)
+                fail_cfg = (
+                    config_to_dict(config)
+                    if router_kind == "fine"
+                    else compositional_config_to_dict(config)
+                )
             except Exception:
                 pass
 
@@ -480,18 +587,21 @@ def build_target_function(
 # ---------------------------------------------------------------------------
 
 def run_smac_optimization(
-    residuals: torch.Tensor,
-    gate_labels: List[int],
-    records: List[Dict],
-    seq_to_idx: Dict[tuple, int],
-    num_classes: int,
-    best_deltas: List[float],
-    sequence_catalog: List,
-    d_model: int,
-    device: torch.device,
-    benchmark: str,
-    output_dir: str,
-    wandb_project: str,
+    *,
+    router_kind: str = "fine",
+    residuals: Optional[torch.Tensor] = None,
+    gate_labels: Optional[List[int]] = None,
+    records: Optional[List[Dict]] = None,
+    seq_to_idx: Optional[Dict[tuple, int]] = None,
+    num_classes: Optional[int] = None,
+    best_deltas: Optional[List[float]] = None,
+    sequence_catalog: Optional[List] = None,
+    compositional_ctx: Optional[Dict[str, Any]] = None,
+    d_model: int = 0,
+    device: torch.device = torch.device("cpu"),
+    benchmark: str = "",
+    output_dir: str = "",
+    wandb_project: str = "",
     wandb_run_name: Optional[str] = None,
     n_trials: int = 100,
     min_budget: float = DEFAULT_TRAIN_MIN_BUDGET,
@@ -500,26 +610,39 @@ def run_smac_optimization(
     expensive_eval_fn: Optional[Callable] = None,
     seed: int = 42,
     walltime_limit: float = float("inf"),
+    resume: bool = False,
 ) -> ThresholdPriorArchive:
     """Set up and run SMAC with Hyperband training fidelity (epoch scaling).
+
+    If ``resume`` is True, SMAC reuses existing state under
+    ``output_dir/smac3_output`` (same scenario metadata) and continues the
+    run with ``MultiFidelityFacade(overwrite=False)``. The best-model
+    tracker reloads ``best_routing_system_<bench>/meta.json`` when present
+    so checkpoints are not clobbered by a weaker first trial.
 
     Returns the populated archive after optimization completes.
     """
     from smac import MultiFidelityFacade, Scenario
 
+    if router_kind not in ("fine", "compositional"):
+        raise ValueError(f"unknown router_kind={router_kind!r}")
+
     # --- Initialize components ---
     os.makedirs(output_dir, exist_ok=True)
     archive_path = os.path.join(output_dir, "threshold_prior_archive.jsonl")
     archive = ThresholdPriorArchive(archive_path)
-    tracker = BestModelTracker(output_dir, benchmark)
+    tracker = BestModelTracker(output_dir, benchmark, resume=resume)
+    initial_trial_idx = len(archive) if resume else 0
 
-    cs = build_configspace()
+    if router_kind == "fine":
+        cs = build_configspace()
+    else:
+        cs = build_configspace_compositional()
 
     # --- W&B init ---
-    run = wandb.init(
-        project=wandb_project,
-        name=wandb_run_name or f"unified-hpo-{benchmark}",
-        config={
+    if router_kind == "fine":
+        wandb_config = {
+            "router_kind": router_kind,
             "benchmark": benchmark,
             "n_trials": n_trials,
             "min_training_budget": min_budget,
@@ -527,10 +650,47 @@ def run_smac_optimization(
             "seed": seed,
             "d_model": d_model,
             "num_classes": num_classes,
-            "n_samples": len(gate_labels),
-        },
-        tags=[benchmark, "unified-hpo", "smac-hyperband-train"],
+            "n_samples": len(gate_labels) if gate_labels is not None else 0,
+            "resume": resume,
+        }
+        wandb_tags = [benchmark, "unified-hpo", "smac-hyperband-train"]
+    else:
+        ctx = compositional_ctx or {}
+        wandb_config = {
+            "router_kind": router_kind,
+            "benchmark": benchmark,
+            "scope": ctx.get("scope"),
+            "benchmarks": ctx.get("benchmarks"),
+            "objective_metric": ctx.get("objective_metric"),
+            "n_trials": n_trials,
+            "min_training_budget": min_budget,
+            "max_training_budget": max_budget,
+            "seed": seed,
+            "d_model": d_model,
+            "resume": resume,
+        }
+        wandb_tags = [
+            benchmark, "unified-hpo", "smac-hyperband-train",
+            "compositional", str(ctx.get("scope", "single")),
+        ]
+
+    run = wandb.init(
+        project=wandb_project,
+        name=wandb_run_name or f"unified-hpo-{router_kind}-{benchmark}",
+        config=wandb_config,
+        tags=wandb_tags,
     )
+    # One immediate scalar so the W&B run does not look "stuck" before the first
+    # heavy trial returns (compositional: train + long post-hoc val metrics).
+    try:
+        run.log(
+            {
+                "hpo/launched": 1.0,
+                "hpo/router_kind": 1.0 if router_kind == "compositional" else 0.0,
+            },
+        )
+    except Exception as e:
+        logger.warning("Initial wandb log failed: %s", e)
 
     # --- Build target function ---
     target_fn = build_target_function(
@@ -552,12 +712,15 @@ def run_smac_optimization(
         expensive_eval_fn=expensive_eval_fn,
         wandb_run=run,
         seed=seed,
+        router_kind=router_kind,
+        compositional_ctx=compositional_ctx,
+        initial_trial_idx=initial_trial_idx,
     )
 
     # --- SMAC Scenario ---
     scenario = Scenario(
         configspace=cs,
-        name=f"unified_hpo_{benchmark}",
+        name=f"unified_hpo_{router_kind}_{benchmark}",
         output_directory=os.path.join(output_dir, "smac3_output"),
         n_trials=n_trials,
         min_budget=min_budget,
@@ -570,14 +733,15 @@ def run_smac_optimization(
     smac = MultiFidelityFacade(
         scenario=scenario,
         target_function=target_fn,
-        overwrite=True,
+        overwrite=not resume,
         logging_level=logging.INFO,
     )
 
     logger.info(
         "Starting SMAC optimization: n_trials=%d  train_budget=[%.1f, %.1f]  "
-        "benchmark=%s  seed=%d",
+        "benchmark=%s  seed=%d  resume=%s  smac_overwrite=%s  trial_idx_offset=%d",
         n_trials, min_budget, max_budget, benchmark, seed,
+        resume, not resume, initial_trial_idx,
     )
 
     incumbent = smac.optimize()

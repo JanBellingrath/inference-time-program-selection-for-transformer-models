@@ -181,6 +181,104 @@ def _load_records(data_dir: str, benchmark: str) -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------
+# Compositional-router data loading
+# ---------------------------------------------------------------------------
+
+def _parse_dense_deltas(entries: Optional[List[str]]) -> Dict[str, Path]:
+    """Parse ``--dense_deltas bench=path`` repeated entries to a dict."""
+    out: Dict[str, Path] = {}
+    if not entries:
+        return out
+    for e in entries:
+        if "=" not in e:
+            raise SystemExit(f"--dense_deltas expects bench=path, got {e!r}")
+        bench, path = e.split("=", 1)
+        p = Path(path)
+        if not p.is_file():
+            raise SystemExit(f"dense delta file not found: {p}")
+        out[bench] = p
+    return out
+
+
+def _load_data_compositional(args) -> Dict[str, Any]:
+    """Load compositional artifacts (catalogue + residuals) once.
+
+    Returns a dict with ``artifacts`` (a ``CompositionalArtifacts``),
+    ``benchmarks``, ``dense_paths``, ``scope``, plus a ``d_model`` for
+    logging.
+    """
+    from routers.compositional_router import CompositionalDataset, load_artifacts
+
+    if not args.catalogue_dir:
+        raise SystemExit("--catalogue_dir is required for --router_kind compositional")
+    if not args.benchmarks:
+        raise SystemExit("--benchmarks is required for --router_kind compositional")
+
+    catalogue_dir = Path(args.catalogue_dir)
+    artifacts = load_artifacts(catalogue_dir, benchmarks=list(args.benchmarks))
+    if not artifacts.catalogues:
+        raise SystemExit(
+            f"no catalogues loaded for benchmarks={args.benchmarks!r} from {catalogue_dir}"
+        )
+    available = list(artifacts.catalogues.keys())
+    benchmarks = [b for b in args.benchmarks if b in available]
+    missing = [b for b in args.benchmarks if b not in available]
+    if missing:
+        logger.warning("compositional artifacts missing for: %s", missing)
+    if not benchmarks:
+        raise SystemExit("none of --benchmarks have compositional artifacts.")
+
+    if args.scope == "single" and len(benchmarks) != 1:
+        raise SystemExit(
+            f"--scope single requires exactly one benchmark, got {benchmarks!r}"
+        )
+
+    dense_paths = _parse_dense_deltas(args.dense_deltas)
+    if dense_paths:
+        unknown = [b for b in dense_paths if b not in benchmarks]
+        if unknown:
+            raise SystemExit(
+                f"--dense_deltas references benchmarks not in --benchmarks: {unknown!r}"
+            )
+
+    if args.objective_metric == "mean_uplift" and not dense_paths:
+        raise SystemExit(
+            "--objective_metric mean_uplift requires --dense_deltas bench=path "
+            "for at least one of --benchmarks."
+        )
+
+    # Probe d_model from a tiny dataset slice (one benchmark).
+    probe_bench = benchmarks[0]
+    probe_dataset = CompositionalDataset(artifacts, benchmarks=[probe_bench])
+    if not probe_dataset.encoder_inputs:
+        raise SystemExit(
+            f"compositional dataset for {probe_bench!r} is empty; cannot infer d_model."
+        )
+    d_model = int(probe_dataset.encoder_inputs[0].shape[-1])
+    n_samples = len(probe_dataset)
+
+    logger.info(
+        "Compositional data loaded: scope=%s benchmarks=%s d_model=%d "
+        "probe_samples(%s)=%d dense_paths=%s",
+        args.scope, benchmarks, d_model, probe_bench, n_samples,
+        {b: str(p) for b, p in dense_paths.items()},
+    )
+
+    return {
+        "kind": "compositional",
+        "artifacts": artifacts,
+        "benchmarks": benchmarks,
+        "dense_paths": dense_paths,
+        "scope": args.scope,
+        "d_model": d_model,
+        "use_full_sequence": bool(args.use_full_sequence),
+        "objective_metric": args.objective_metric,
+        "val_fraction": float(args.val_fraction),
+        "batch_size": int(args.batch_size),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Expensive evaluation builder (lazy LLM loading)
 # ---------------------------------------------------------------------------
 
@@ -369,15 +467,40 @@ def _run_confirmation(
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Unified SMAC + Hyperband (training epochs) for fine routers",
+        description="Unified SMAC + Hyperband (training epochs) for fine / compositional routers",
     )
-    p.add_argument("--data_dir", type=str, required=True,
-                   help="Dir with {bench}_pivot_residuals.pt and {bench}.jsonl")
-    p.add_argument("--benchmark", type=str, required=True)
-    p.add_argument("--results_dir", type=str, required=True,
-                   help="Predictions dir for resolving anchor sequences")
+    p.add_argument("--router_kind", choices=["fine", "compositional"], default="fine",
+                   help="Which router family to optimize. Default 'fine' preserves the "
+                        "existing behaviour; 'compositional' uses the legal-catalogue router.")
+    # --- Fine-router data flags (required only for --router_kind fine) ---
+    p.add_argument("--data_dir", type=str, default=None,
+                   help="(fine) Dir with {bench}_pivot_residuals.pt and {bench}.jsonl")
+    p.add_argument("--benchmark", type=str, default=None,
+                   help="(fine) single benchmark to optimize")
+    p.add_argument("--results_dir", type=str, default=None,
+                   help="(fine) predictions dir for resolving anchor sequences")
     p.add_argument("--model_name", type=str,
                    default="Qwen/Qwen2.5-0.5B-Instruct")
+    # --- Compositional-router data flags ---
+    p.add_argument("--catalogue_dir", type=str, default=None,
+                   help="(compositional) build_compositional_catalogues output dir")
+    p.add_argument("--scope", choices=["single", "joint"], default="single",
+                   help="(compositional) per-benchmark router or one shared router.")
+    p.add_argument("--benchmarks", type=str, nargs="+", default=None,
+                   help="(compositional) benchmarks to load from --catalogue_dir.")
+    p.add_argument("--dense_deltas", type=str, nargs="+", default=None,
+                   help="(compositional) bench=path entries with dense Δ matrices "
+                        "(produced by data_prep.import_mined_dense_matrix or dr-llm).")
+    p.add_argument("--objective_metric",
+                   choices=["mean_uplift", "obs_top1_acc"], default="mean_uplift",
+                   help="(compositional) which val metric SMAC maximises.")
+    p.add_argument("--use_full_sequence", action="store_true",
+                   help="(compositional) load full-sequence residuals (not used by "
+                        "the default last_token compressor).")
+    p.add_argument("--val_fraction", type=float, default=0.15,
+                   help="(compositional) train/val split fraction for the inner trainer.")
+    p.add_argument("--batch_size", type=int, default=64,
+                   help="(compositional) batch size for the inner trainer.")
     p.add_argument("--output_dir", type=str, default="hpo_results",
                    help="Output directory for SMAC state, archive, and best models")
     p.add_argument("--wandb_project", type=str, default="unified-fine-routing-hpo")
@@ -411,6 +534,13 @@ def parse_args():
 
     p.add_argument("--no_wandb", action="store_true",
                    help="Disable W&B logging entirely")
+    p.add_argument(
+        "--resume",
+        choices=["yes", "no"],
+        default="no",
+        help="yes: continue SMAC from output_dir/smac3_output (surrogate + run history), "
+             "reload best proxy from best_routing_system_*/meta.json; no: fresh run (overwrite).",
+    )
 
     return p.parse_args()
 
@@ -423,46 +553,81 @@ def main():
     if args.no_wandb:
         os.environ["WANDB_MODE"] = "disabled"
 
-    # --- Load data ---
-    data = _load_data(args)
+    resume = args.resume == "yes"
 
-    # --- Build expensive eval function (lazy) ---
-    expensive_eval_fn = _build_expensive_eval_fn(args, data)
-
-    # --- Run optimization ---
     from experiments.unified_hpo.smac_runner import run_smac_optimization
 
-    archive = run_smac_optimization(
-        residuals=data["residuals"],
-        gate_labels=data["gate_labels"],
-        records=data["records"],
-        seq_to_idx=data["seq_to_idx"],
-        num_classes=data["num_classes"],
-        best_deltas=data["best_deltas"],
-        sequence_catalog=data["sequence_catalog"],
-        d_model=data["d_model"],
-        device=device,
-        benchmark=args.benchmark,
-        output_dir=args.output_dir,
-        wandb_project=args.wandb_project,
-        wandb_run_name=args.wandb_run_name,
-        n_trials=args.n_trials,
-        min_budget=args.min_budget,
-        max_budget=args.max_budget,
-        enable_expensive_eval=args.enable_expensive_eval,
-        expensive_eval_fn=expensive_eval_fn,
-        seed=args.seed,
-        walltime_limit=args.walltime_limit,
-    )
+    if args.router_kind == "fine":
+        if not args.data_dir or not args.benchmark or not args.results_dir:
+            raise SystemExit(
+                "--router_kind fine requires --data_dir, --benchmark, --results_dir."
+            )
+        data = _load_data(args)
+        expensive_eval_fn = _build_expensive_eval_fn(args, data)
 
-    # --- Post-HPO confirmation ---
-    if args.confirm_top_k > 0:
-        archive_path = os.path.join(args.output_dir, "threshold_prior_archive.jsonl")
-        _run_confirmation(
-            args, data, archive_path,
-            top_k=args.confirm_top_k,
-            seeds=args.confirm_seeds,
+        archive = run_smac_optimization(
+            router_kind="fine",
+            residuals=data["residuals"],
+            gate_labels=data["gate_labels"],
+            records=data["records"],
+            seq_to_idx=data["seq_to_idx"],
+            num_classes=data["num_classes"],
+            best_deltas=data["best_deltas"],
+            sequence_catalog=data["sequence_catalog"],
+            d_model=data["d_model"],
+            device=device,
+            benchmark=args.benchmark,
+            output_dir=args.output_dir,
+            wandb_project=args.wandb_project,
+            wandb_run_name=args.wandb_run_name,
+            n_trials=args.n_trials,
+            min_budget=args.min_budget,
+            max_budget=args.max_budget,
+            enable_expensive_eval=args.enable_expensive_eval,
+            expensive_eval_fn=expensive_eval_fn,
+            seed=args.seed,
+            walltime_limit=args.walltime_limit,
+            resume=resume,
         )
+
+        if args.confirm_top_k > 0:
+            archive_path = os.path.join(args.output_dir, "threshold_prior_archive.jsonl")
+            _run_confirmation(
+                args, data, archive_path,
+                top_k=args.confirm_top_k,
+                seeds=args.confirm_seeds,
+            )
+    else:
+        data = _load_data_compositional(args)
+        # Compositional path: use the joined benchmarks string as the
+        # tracker/logging "benchmark" identity.
+        bench_label = (
+            data["benchmarks"][0] if data["scope"] == "single"
+            else "+".join(data["benchmarks"])
+        )
+        archive = run_smac_optimization(
+            router_kind="compositional",
+            compositional_ctx=data,
+            d_model=data["d_model"],
+            device=device,
+            benchmark=bench_label,
+            output_dir=args.output_dir,
+            wandb_project=args.wandb_project,
+            wandb_run_name=args.wandb_run_name,
+            n_trials=args.n_trials,
+            min_budget=args.min_budget,
+            max_budget=args.max_budget,
+            enable_expensive_eval=False,
+            expensive_eval_fn=None,
+            seed=args.seed,
+            walltime_limit=args.walltime_limit,
+            resume=resume,
+        )
+        if args.confirm_top_k > 0:
+            logger.warning(
+                "--confirm_top_k is not implemented for --router_kind compositional; "
+                "skipping confirmation phase."
+            )
 
     logger.info("Done.")
 

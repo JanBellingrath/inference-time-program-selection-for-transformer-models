@@ -17,3 +17,23 @@ Usage::
         --wandb_project unified-fine-routing-hpo \\
         --output_dir hpo_results/winogrande
 """
+
+from experiments.unified_hpo.compositional_objective import (
+    train_and_score_compositional,
+)
+from experiments.unified_hpo.search_space_compositional import (
+    build_configspace_compositional,
+    get_edit_hidden_dims,
+    get_pair_hidden_dims,
+    get_pair_topk_primitives,
+    get_unary_hidden_dims,
+)
+
+__all__ = [
+    "build_configspace_compositional",
+    "train_and_score_compositional",
+    "get_edit_hidden_dims",
+    "get_unary_hidden_dims",
+    "get_pair_hidden_dims",
+    "get_pair_topk_primitives",
+]

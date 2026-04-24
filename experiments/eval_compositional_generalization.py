@@ -134,6 +134,7 @@ def _build_router_from_checkpoint(
             pair_dropout=cfg.get("pair_dropout", 0.1),
             pair_zero_init=cfg.get("pair_zero_init", True),
             pair_topk_primitives=cfg.get("pair_topk_primitives"),
+            use_anchor_bias=cfg.get("use_anchor_bias", False),
         ).to(device)
         state = payload.get("model_state_dict") or payload.get("state_dict")
         router.load_state_dict(state)

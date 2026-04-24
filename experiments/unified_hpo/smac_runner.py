@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import builtins
 import hashlib
 import json
 import logging
@@ -175,6 +176,156 @@ class BestModelTracker:
 # W&B logging helpers
 # ---------------------------------------------------------------------------
 
+
+def _define_hpo_wandb_charts(router_kind: str) -> None:
+    """Register custom x-axis ``hpo_trial`` = SMAC trial index; charts use that for x, not the internal counter.
+
+    W&B only binds lines to the intended x-axis if the step is a *logged metric* plus
+    ``step_metric=``; relying on ``log(..., step=k)`` alone often leaves the default
+    workspace with no/empty line charts. See https://docs.wandb.ai/guides/track/log/customize-logging-axes
+    """
+    # Step key first (name without "/" avoids odd grouping edge cases in older clients).
+    try:
+        wandb.define_metric("hpo_trial", summary="max")
+    except Exception as e:  # noqa: S110
+        logger.debug("define_metric hpo_trial: %s", e)
+    if router_kind == "compositional":
+        for name, how in [
+            ("hpo/val_obs_top1", "max"),
+            ("hpo/val_obs_top3", "max"),
+            ("hpo/val_obs_top5", "max"),
+            ("hpo/mean_uplift_vs_anchor", "max"),
+            ("hpo/uplift_vs_best_route", "max"),
+            ("hpo/frac_oracle_uplift", "max"),
+            ("hpo/dense_top1", "max"),
+            ("hpo/proxy", "max"),
+            ("hpo/smac_cost", "min"),
+            ("hpo/router_val_loss", "min"),
+            ("hpo/budget", "max"),
+            ("hpo/epochs", "max"),
+            ("hpo/wall_s", "max"),
+            ("hpo/new_best", "max"),
+            ("hpo/trial_failed", "max"),
+        ]:
+            try:
+                wandb.define_metric(name, step_metric="hpo_trial", summary=how)
+            except Exception as e:  # noqa: S110
+                logger.debug("define_metric %s: %s", name, e)
+    else:
+        for name, how in [
+            ("hpo/proxy", "max"),
+            ("hpo/smac_cost", "min"),
+            ("hpo/val_loss", "min"),
+            ("hpo/entropy_mean", "min"),
+            ("hpo/budget", "max"),
+            ("hpo/wall_s", "max"),
+            ("hpo/new_best", "max"),
+        ]:
+            try:
+                wandb.define_metric(name, step_metric="hpo_trial", summary=how)
+            except Exception as e:  # noqa: S110
+                logger.debug("define_metric %s: %s", name, e)
+        try:
+            wandb.define_metric("hpo/cfg_gating", step_metric="hpo_trial")
+        except Exception as e:  # noqa: S110
+            logger.debug("define_metric hpo/cfg_gating: %s", e)
+    for name, how in [
+        ("hpo/wb_layout", "max"),
+        ("hpo/router_kind", "max"),
+        ("hpo/resumed_smac", "max"),
+        ("hpo/continues_from_trial", "max"),
+    ]:
+        try:
+            wandb.define_metric(name, step_metric="hpo_trial", summary=how)
+        except Exception as e:  # noqa: S110
+            logger.debug("define_metric %s: %s", name, e)
+
+
+def _hpo_cumulative_compositional_chart(history: List[Dict[str, Any]]) -> Any:
+    """One Custom Chart with multiple lines (always visible under Media / Charts with data)."""
+    if not history:
+        return None
+    xs: List[int] = []
+    for h in history:
+        v = h.get("hpo_trial")
+        if v is not None:
+            xs.append(int(v))
+    if len(xs) != len(history):
+        return None
+    line_defs = [
+        ("hpo/val_obs_top1", "val_obs_top1"),
+        ("hpo/val_obs_top3", "val_obs_top3"),
+        ("hpo/mean_uplift_vs_anchor", "mean_uplift_vs_anchor"),
+        ("hpo/proxy", "proxy"),
+    ]
+    ys: List[List[float]] = []
+    keys: List[str] = []
+    for key, leg in line_defs:
+        keys.append(leg)
+        ys.append([float(h.get(key, 0.0) or 0.0) for h in history])
+    return wandb.plot.line_series(
+        xs, ys, keys=keys, title="HPO (headline metrics vs trial)", xname="SMAC trial",
+    )
+
+
+def _log_trial_wandb_compositional(
+    train_result: TrainResult,
+    eval_result: EvalResult,
+    trial_idx: int,
+    wall_time: float,
+    is_new_best: bool,
+    training_budget: float,
+) -> Dict[str, Any]:
+    """One row per trial: validation ranking + downstream vs baselines, then SMAC cost."""
+    m = getattr(train_result, "compositional_metrics", None) or {}
+    vd = m.get("val_downstream")
+    if not isinstance(vd, dict):
+        vd = {}
+    vr = m.get("val_ranking")
+    if not isinstance(vr, dict):
+        vr = {}
+    r_acc = float(vd.get("router_acc", 0.0) or 0.0)
+    bf = float(vd.get("best_fixed_acc", 0.0) or 0.0)
+    # Order: val observability, downstream deltas vs baselines, then SMAC + run metadata.
+    out: Dict[str, Any] = {
+        "hpo/val_obs_top1": float(vr.get("obs_top1_acc", 0.0) or 0.0),
+        "hpo/val_obs_top3": float(vr.get("obs_top3_acc", 0.0) or 0.0),
+        "hpo/val_obs_top5": float(vr.get("obs_top5_acc", 0.0) or 0.0),
+        "hpo/mean_uplift_vs_anchor": float(vd.get("mean_uplift", 0.0) or 0.0),
+        "hpo/uplift_vs_best_route": r_acc - bf,
+        "hpo/frac_oracle_uplift": float(vd.get("frac_oracle", 0.0) or 0.0),
+        "hpo/dense_top1": float(vd.get("dense_top1_acc", 0.0) or 0.0),
+        "hpo/proxy": float(eval_result.proxy_gain),
+        "hpo/smac_cost": -float(eval_result.proxy_gain),
+        "hpo/router_val_loss": float(getattr(train_result, "router_val_loss", 0.0) or 0.0),
+        "hpo/budget": float(training_budget),
+        "hpo/epochs": int(getattr(train_result, "router_epochs_used", 0) or 0),
+        "hpo/wall_s": float(wall_time),
+        "hpo/new_best": int(is_new_best),
+    }
+    return out
+
+
+def _log_trial_wandb_fine(
+    config: Dict,
+    train_result: TrainResult,
+    eval_result: EvalResult,
+    wall_time: float,
+    is_new_best: bool,
+    training_budget: float,
+) -> Dict[str, Any]:
+    return {
+        "hpo/proxy": float(eval_result.proxy_gain),
+        "hpo/smac_cost": -float(eval_result.proxy_gain),
+        "hpo/val_loss": float(train_result.router_val_loss or 0.0),
+        "hpo/entropy_mean": float(getattr(train_result, "router_entropy_mean", 0.0) or 0.0),
+        "hpo/budget": float(training_budget),
+        "hpo/wall_s": float(wall_time),
+        "hpo/new_best": int(is_new_best),
+        "hpo/cfg_gating": str(config.get("gating_mode", "")),
+    }
+
+
 def _log_trial_to_wandb(
     config: Dict,
     train_result: TrainResult,
@@ -183,69 +334,32 @@ def _log_trial_to_wandb(
     wall_time: float,
     is_new_best: bool,
     training_budget: float,
+    *,
+    router_kind: str = "fine",
+    hpo_trial_history: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
-    """Log comprehensive metrics for a single trial to the active W&B run."""
-    gating_mode = config.get("gating_mode", "?")
-    target_source = config.get("target_source", "?")
-    router_loss = config.get("router_loss", "?")
-
-    log_dict: Dict[str, Any] = {
-        # Branch identifiers
-        "trial_idx": trial_idx,
-        "training_budget": training_budget,
-        "router_epochs_used": train_result.router_epochs_used,
-        "gate_epochs_used": train_result.gate_epochs_used,
-        "gating_mode": gating_mode,
-        "target_source": target_source,
-        "router_loss": router_loss,
-        "router_train_subset": config.get("router_train_subset", "all"),
-
-        # Training summaries
-        "router_val_loss": train_result.router_val_loss,
-        "gate_val_loss": train_result.gate_val_loss,
-        "delta_gate_val_loss": train_result.delta_gate_val_loss,
-        "num_train_samples": train_result.num_train_samples,
-        "num_val_samples": train_result.num_val_samples,
-        "training_time_s": train_result.training_time_s,
-
-        # Diagnostics
-        "predicted_noop_rate": train_result.predicted_noop_rate,
-        "router_entropy_mean": train_result.router_entropy_mean,
-        "router_entropy_std": train_result.router_entropy_std,
-
-        # Score distribution
-        "score_mean": train_result.score_mean,
-        "score_std": train_result.score_std,
-        "score_min": train_result.score_min,
-        "score_max": train_result.score_max,
-        **{f"score_{k}": v for k, v in train_result.score_quantiles.items()},
-
-        # Calibration
-        "best_rho": eval_result.calibration.best_rho,
-        "best_threshold": eval_result.calibration.best_threshold,
-        "realized_open_fraction": eval_result.calibration.realized_open_fraction,
-        "n_candidates_tested": len(eval_result.calibration.candidates_tested),
-
-        # Objective
-        "proxy_gain": eval_result.proxy_gain,
-        "oracle_proxy_gain": eval_result.oracle_proxy_gain,
-        "routing_val_size_used": eval_result.routing_val_size_used,
-
-        # Timing
-        "wall_time_s": wall_time,
-        "is_new_best": int(is_new_best),
-    }
-
-    # Log all active config parameters
-    for k, v in config.items():
-        log_dict[f"config/{k}"] = v
-
-    # Expensive eval metrics (if available)
-    if eval_result.expensive_metrics is not None:
-        for k, v in eval_result.expensive_metrics.items():
-            log_dict[f"expensive/{k}"] = v
-
-    wandb.log(log_dict)
+    """Log one W&B point per HPO trial. X-axis = ``hpo_trial`` (see ``_define_hpo_wandb_charts``); do not use ``log(..., step=)`` here."""
+    try:
+        if router_kind == "compositional":
+            row = _log_trial_wandb_compositional(
+                train_result, eval_result, trial_idx, wall_time,
+                is_new_best, training_budget,
+            )
+        else:
+            row = _log_trial_wandb_fine(
+                config, train_result, eval_result, wall_time,
+                is_new_best, training_budget,
+            )
+        row["hpo_trial"] = float(trial_idx)
+        if hpo_trial_history is not None and router_kind == "compositional":
+            hpo_trial_history.append({k: v for k, v in row.items() if k != "hpo/curves_headline"})
+            ch = _hpo_cumulative_compositional_chart(hpo_trial_history)
+            if ch is not None:
+                row["hpo/curves_headline"] = ch
+        # Custom x-axis: omit ``step=`` so W&B uses ``hpo_trial`` (define_metric) for line charts.
+        wandb.log(row)
+    except Exception as e:
+        logger.warning("W&B hpo_trial log failed: %s", e)
 
 
 def log_sweep_summary(
@@ -353,6 +467,7 @@ def build_target_function(
         raise ValueError("router_kind='compositional' requires compositional_ctx")
 
     trial_counter = [int(initial_trial_idx)]
+    hpo_trial_history: List[Dict[str, Any]] = []
 
     def target_function(config, seed: int = 0, budget: float = max_budget) -> float:
         """SMAC target function.  Returns cost (lower is better)."""
@@ -370,21 +485,6 @@ def build_target_function(
                 cfg = config_to_dict(config)
             else:
                 cfg = compositional_config_to_dict(config)
-
-            # Per-trial heartbeat: visible in W&B while train_one_router is running.
-            if wandb_run is not None:
-                try:
-                    # Use global wandb.log so the active run (SMAC’s thread) always matches.
-                    wandb.log(
-                        {
-                            "trial/idx": float(trial_idx),
-                            "trial/budget": float(budget),
-                            "trial/router_epochs": float(router_e),
-                            "trial/phase": 0.0,  # 0=train started; 1=done in full metrics
-                        },
-                    )
-                except Exception as e:
-                    logger.warning("trial-start wandb log failed: %s", e)
 
             if router_kind == "fine":
                 logger.info(
@@ -445,10 +545,10 @@ def build_target_function(
                     device=device,
                     objective_metric=ctx.get("objective_metric", "mean_uplift"),
                     use_full_sequence=bool(ctx.get("use_full_sequence", False)),
-                    wandb_run=wandb_run,
-                    wandb_prefix="compositional/",
+                    wandb_run=None,
                     use_dense_supervision=None,
                     downstream_eval_every=0,
+                    local_moebius_paths=ctx.get("local_moebius_paths") or None,
                 )
 
                 full_train = is_full_training_budget(budget, max_budget)
@@ -485,11 +585,16 @@ def build_target_function(
                     wandb_run=wandb_run,
                 )
 
-            # --- W&B logging ---
-            _log_trial_to_wandb(
-                cfg, train_result, eval_result,
-                trial_idx, wall_time, is_new_best, budget,
-            )
+            # --- W&B: one step per trial (flat hpo/*); inner training logs disabled for compositional HPO ---
+            if wandb_run is not None:
+                _log_trial_to_wandb(
+                    cfg, train_result, eval_result,
+                    trial_idx, wall_time, is_new_best, budget,
+                    router_kind=router_kind,
+                    hpo_trial_history=hpo_trial_history
+                    if router_kind == "compositional"
+                    else None,
+                )
 
             # --- Archive update ---
             archive_rec = ArchiveRecord(
@@ -569,13 +674,18 @@ def build_target_function(
                 proxy_gain=-FAILURE_COST,
             ))
 
-            # Log failure to W&B
-            wandb.log({
-                "trial_idx": trial_idx,
-                "proxy_gain": -FAILURE_COST,
-                "failed": True,
-                "error": str(e),
-            })
+            if wandb_run is not None:
+                try:
+                    wandb.log(
+                        {
+                            "hpo_trial": float(trial_idx),
+                            "hpo/trial_failed": 1.0,
+                            "hpo/smac_cost": float(FAILURE_COST),
+                            "hpo/proxy": -float(FAILURE_COST),
+                        },
+                    )
+                except Exception as log_e:
+                    logger.debug("W&B failure log: %s", log_e)
 
             return FAILURE_COST
 
@@ -656,12 +766,14 @@ def run_smac_optimization(
         wandb_tags = [benchmark, "unified-hpo", "smac-hyperband-train"]
     else:
         ctx = compositional_ctx or {}
+        local_paths = ctx.get("local_moebius_paths") or {}
         wandb_config = {
             "router_kind": router_kind,
             "benchmark": benchmark,
             "scope": ctx.get("scope"),
             "benchmarks": ctx.get("benchmarks"),
             "objective_metric": ctx.get("objective_metric"),
+            "local_moebius_benchmarks": sorted(local_paths.keys()),
             "n_trials": n_trials,
             "min_training_budget": min_budget,
             "max_training_budget": max_budget,
@@ -680,15 +792,27 @@ def run_smac_optimization(
         config=wandb_config,
         tags=wandb_tags,
     )
-    # One immediate scalar so the W&B run does not look "stuck" before the first
-    # heavy trial returns (compositional: train + long post-hoc val metrics).
+    _define_hpo_wandb_charts(router_kind)
+    # One metric group ``hpo/*``; per-trial logs use step=trial index (see _log_trial_to_wandb).
     try:
-        run.log(
-            {
-                "hpo/launched": 1.0,
-                "hpo/router_kind": 1.0 if router_kind == "compositional" else 0.0,
-            },
-        )
+        n_arch = len(archive)
+        if not resume:
+            run.log(
+                {
+                    "hpo_trial": -1.0,
+                    "hpo/wb_layout": 3.0,
+                    "hpo/router_kind": 1.0 if router_kind == "compositional" else 0.0,
+                },
+            )
+        else:
+            run.log(
+                {
+                    "hpo_trial": -1.0,
+                    "hpo/resumed_smac": 1.0,
+                    "hpo/continues_from_trial": float(n_arch),
+                    "hpo/router_kind": 1.0 if router_kind == "compositional" else 0.0,
+                },
+            )
     except Exception as e:
         logger.warning("Initial wandb log failed: %s", e)
 
@@ -730,12 +854,31 @@ def run_smac_optimization(
         deterministic=True,
     )
 
-    smac = MultiFidelityFacade(
-        scenario=scenario,
-        target_function=target_fn,
-        overwrite=not resume,
-        logging_level=logging.INFO,
-    )
+    # SMAC may call ``input()`` if the on-disk scenario differs (e.g. after a code
+    # change) even when resuming, which fails under nohup. Set
+    # ``UNIFIED_HPO_SMAC_ON_MISMATCH=1`` (overwrite) or ``=2`` (rename to *-old).
+    _mismatch = os.environ.get("UNIFIED_HPO_SMAC_ON_MISMATCH", "").strip()
+    _prev_input = getattr(builtins, "input", None)
+    if _mismatch in ("1", "2") and _prev_input is not None:
+        def _input_patch(prompt: str = "") -> str:
+            logger.warning(
+                "SMAC scenario mismatch: auto-responding with "
+                "UNIFIED_HPO_SMAC_ON_MISMATCH=%r (no TTY).",
+                _mismatch,
+            )
+            return _mismatch
+
+        builtins.input = _input_patch  # type: ignore[assignment]
+    try:
+        smac = MultiFidelityFacade(
+            scenario=scenario,
+            target_function=target_fn,
+            overwrite=not resume,
+            logging_level=logging.INFO,
+        )
+    finally:
+        if _mismatch in ("1", "2") and _prev_input is not None:
+            builtins.input = _prev_input  # type: ignore[assignment]
 
     logger.info(
         "Starting SMAC optimization: n_trials=%d  train_budget=[%.1f, %.1f]  "
@@ -753,11 +896,11 @@ def run_smac_optimization(
     if tracker.best_config:
         logger.info("Best config: %s", json.dumps(tracker.best_config, indent=2, default=str))
 
-    # Log sweep summary to W&B
-    try:
-        log_sweep_summary(archive, cs)
-    except Exception as e:
-        logger.warning("Failed to log sweep summary: %s", e)
+    if router_kind == "fine":
+        try:
+            log_sweep_summary(archive, cs)
+        except Exception as e:
+            logger.warning("Failed to log sweep summary: %s", e)
 
     run.finish()
     return archive

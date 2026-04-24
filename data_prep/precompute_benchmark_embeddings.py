@@ -33,6 +33,10 @@ from datasets import load_dataset, get_dataset_config_names, concatenate_dataset
 from core.flexible_models import get_is_instruct, get_model_class
 from core.permutation_mcts import prepare_arc_data
 
+raise RuntimeError("This script is deprecated and should not be used.")
+
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",

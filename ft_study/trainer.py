@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 from datasets import Dataset
 from transformers import (
@@ -421,7 +422,13 @@ def train_lora(
             weight_decay=ft_cfg.weight_decay,
         )
 
-    training_args = SFTConfig(
+    use_assistant_only = (
+        tokenizer.chat_template is not None
+        and "{% generation %}" in (tokenizer.chat_template or "")
+    )
+    use_completion_only = not use_assistant_only
+
+    sft_kwargs: Dict[str, Any] = dict(
         output_dir=output_dir,
         num_train_epochs=ft_cfg.num_train_epochs,
         per_device_train_batch_size=ft_cfg.per_device_train_batch_size,
@@ -437,8 +444,8 @@ def train_lora(
         save_strategy="epoch",
         eval_strategy="epoch" if val_dataset is not None else "no",
         load_best_model_at_end=val_dataset is not None,
-        metric_for_best_model="eval_loss" if val_dataset is not None else None,
-        greater_is_better=False if val_dataset is not None else None,
+        metric_for_best_model="acc" if val_dataset is not None else None,
+        greater_is_better=True if val_dataset is not None else None,
         save_total_limit=3,
         dataloader_num_workers=ft_cfg.dataloader_num_workers,
         dataloader_drop_last=ft_cfg.dataloader_drop_last,
@@ -450,6 +457,41 @@ def train_lora(
         max_length=ft_cfg.max_seq_length,
         packing=ft_cfg.packing,
     )
+    try:
+        if use_assistant_only:
+            training_args = SFTConfig(assistant_only_loss=True, **sft_kwargs)
+            logger.info("SFTConfig: assistant_only_loss=True (chat template supports it)")
+        else:
+            training_args = SFTConfig(completion_only_loss=True, **sft_kwargs)
+            logger.info(
+                "SFTConfig: completion_only_loss=True "
+                "(chat template lacks {%% generation %%}; falling back)"
+            )
+    except TypeError as e:
+        logger.warning(
+            "Installed TRL does not accept assistant/completion-only-loss "
+            "arg (%s); falling back to default whole-sequence loss.", e,
+        )
+        training_args = SFTConfig(**sft_kwargs)
+
+    def _preprocess_logits_for_metrics(logits, labels):
+        if isinstance(logits, tuple):
+            logits = logits[0]
+        return logits.argmax(dim=-1)
+
+    def _compute_metrics(eval_pred):
+        preds = np.asarray(eval_pred.predictions)
+        labels = np.asarray(eval_pred.label_ids)
+        if preds.ndim == 3:
+            preds = preds.argmax(axis=-1)
+        shift_preds = preds[:, :-1]
+        shift_labels = labels[:, 1:]
+        mask = shift_labels != -100
+        n = int(mask.sum())
+        if n == 0:
+            return {"acc": 0.0}
+        correct = ((shift_preds == shift_labels) & mask).sum()
+        return {"acc": float(correct) / n}
 
     trainer = SFTTrainer(
         model=model,
@@ -458,6 +500,10 @@ def train_lora(
         eval_dataset=val_dataset,
         processing_class=tokenizer,
         optimizers=(custom_optimizer, None) if custom_optimizer is not None else (None, None),
+        compute_metrics=_compute_metrics if val_dataset is not None else None,
+        preprocess_logits_for_metrics=(
+            _preprocess_logits_for_metrics if val_dataset is not None else None
+        ),
     )
 
     torch.cuda.reset_peak_memory_stats()

@@ -248,16 +248,40 @@ def load_artifacts(output_dir: _Path, *, benchmarks: Optional[Iterable[str]] = N
     primitives = load_primitive_catalogue(output_dir / manifest["primitives_path"])
     bench_filter = set(benchmarks) if benchmarks else None
     catalogues: Dict[str, LegalCatalogue] = {}
+    # Joint catalogues (``data_prep.build_joint_catalogue``) point every
+    # benchmark at the *same* incidence / pair-incidence files. Loading the
+    # tensors once per benchmark wastes O(N_bench) memory on the largest
+    # artifact, so we cache by (incidence_path, pair_incidence_path) and
+    # reuse a single ``LegalCatalogue`` struct across benches. The
+    # per-benchmark ``anchor`` is kept distinct (it is benchmark-specific
+    # bookkeeping and never enters scoring).
+    cache: Dict[Tuple[str, Optional[str]], LegalCatalogue] = {}
     for bench, info in manifest["benchmarks"].items():
         if bench_filter and bench not in bench_filter:
             continue
         pair_path = info.get("pair_incidence_path")
-        cat = load_legal_catalogue(
-            output_dir / info["incidence_path"],
-            benchmark=bench,
-            anchor=info["anchor"],
-            pair_incidence_path=(output_dir / pair_path) if pair_path else None,
-        )
+        key = (str(info["incidence_path"]), str(pair_path) if pair_path else None)
+        cached = cache.get(key)
+        if cached is None:
+            cat = load_legal_catalogue(
+                output_dir / info["incidence_path"],
+                benchmark=bench,
+                anchor=info["anchor"],
+                pair_incidence_path=(output_dir / pair_path) if pair_path else None,
+            )
+            cache[key] = cat
+        else:
+            # Share the heavy tensors; give this benchmark its own
+            # ``benchmark`` / ``anchor`` identity without copying tensors.
+            cat = LegalCatalogue(
+                benchmark=bench,
+                anchor=list(info["anchor"]),
+                A=cached.A,
+                lengths=cached.lengths,
+                B=cached.B,
+                pair_index=cached.pair_index,
+                relation_features=cached.relation_features,
+            )
         if cat.n_primitives != len(primitives):
             raise ValueError(
                 f"[{bench}] incidence M={cat.n_primitives} != |O_train|={len(primitives)}"
@@ -655,11 +679,32 @@ class PairwiseScorer(nn.Module):
         Phi                : ``[M, d_phi]`` primitive embeddings.
         pair_index         : ``[P, 2]`` long tensor with ``i < j``.
         relation_features  : ``[P, d_r]`` symmetric relation features.
+
+        Implementation note
+        -------------------
+        The first ``Linear`` of ``self.net`` is ``y = W [z | p] + b`` where
+        ``z`` is the question encoding (``[B, d_z]``) and ``p`` is the
+        per-pair feature (``[P, 3*d_phi + d_r]``). That Linear is linear
+        in its input, so it is mathematically identical to::
+
+            y = W_z z + W_p p + b
+
+        i.e. we can project ``z`` once (``[B, H]``) and ``p`` once
+        (``[P, H]``) and broadcast-add into ``[B, P, H]`` — never
+        materialising the ``[B, P, d_z + 3*d_phi + d_r]`` tensor that the
+        concatenation form requires. For B=40, P=1532, d_z=d_phi=320 on
+        the CSQA assign-inclusive catalogue this cuts this module's peak
+        activation memory from ~580 MB to ~280 MB and makes forward+bwd
+        ~2.6x faster (empirical, cf. ``scripts/profile_pair_refactor.py``).
+
+        Parameter *names* and *shapes* are preserved (we still own
+        ``self.net[0]``) so existing checkpoints load unchanged.
         """
         B = g_q.shape[0]
         P = int(pair_index.shape[0])
         if P == 0:
             return g_q.new_zeros(B, 0)
+        d_z = int(g_q.shape[-1])
         i = pair_index[:, 0]
         j = pair_index[:, 1]
         phi_i = Phi.index_select(0, i)         # [P, d_phi]
@@ -670,8 +715,32 @@ class PairwiseScorer(nn.Module):
         pair_feats = torch.cat(
             [sym_sum, sym_abs, sym_prod, relation_features.to(g_q.dtype)], dim=-1,
         )                                      # [P, 3 d_phi + d_r]
-        # [B, P, d_z + 3 d_phi + d_r]
-        z_expanded = g_q.unsqueeze(1).expand(B, P, g_q.shape[-1])
+
+        first = self.net[0]
+        if isinstance(first, nn.Linear):
+            # Factored first Linear. This avoids the [B, P, d_z + 3 d_phi + d_r]
+            # concatenation and replaces it with two smaller matmuls plus a
+            # broadcast add to [B, P, H]. Subsequent layers (GELU, Dropout,
+            # additional Linears) still run on [B, P, H] unchanged, so
+            # training behaviour (including dropout masks) is identical.
+            W = first.weight                    # [H, d_z + 3 d_phi + d_r]
+            # Slicing on dim=1 produces non-contiguous views; F.linear falls
+            # back to a slow kernel path in that case, so make contiguous.
+            # The copy is small (O(H * in_dim)) and happens once per forward;
+            # it pays for itself many times over because we avoid the
+            # [B, P, in_dim] materialisation entirely.
+            W_z = W[:, :d_z].contiguous()
+            W_p = W[:, d_z:].contiguous()
+            # Put the bias on the pair-side matmul so it is added exactly once.
+            z_hidden = F.linear(g_q, W_z, bias=None)                  # [B, H]
+            pair_hidden = F.linear(pair_feats, W_p, bias=first.bias)  # [P, H]
+            pre = z_hidden.unsqueeze(1) + pair_hidden.unsqueeze(0)    # [B, P, H]
+            tail = self.net[1:] if len(self.net) > 1 else nn.Identity()
+            return tail(pre).squeeze(-1)                              # [B, P]
+
+        # Fallback: original concatenation path (kept for exotic ``self.net``
+        # layouts where ``net[0]`` is not a plain Linear).
+        z_expanded = g_q.unsqueeze(1).expand(B, P, d_z)
         pair_expanded = pair_feats.unsqueeze(0).expand(B, P, pair_feats.shape[-1])
         x = torch.cat([z_expanded, pair_expanded], dim=-1)
         return self.net(x).squeeze(-1)         # [B, P]
@@ -720,6 +789,7 @@ class CompositionalRouter(nn.Module):
         pair_dropout: float = 0.1,
         pair_zero_init: bool = True,
         pair_topk_primitives: Optional[int] = None,
+        use_anchor_bias: bool = False,
     ):
         super().__init__()
         self._primitives_list: List[PrimitiveSpec] = list(primitives)
@@ -760,6 +830,19 @@ class CompositionalRouter(nn.Module):
         self.pair_topk_primitives: Optional[int] = (
             int(pair_topk_primitives) if pair_topk_primitives else None
         )
+        # Optional learnable scalar added to the anchor (row 0) program score.
+        # By catalogue construction the anchor has A[0,:]=0, B[0,:]=0,
+        # lengths[0]=0, so S_q(anchor) ≡ 0 for any (u, v). With λ>0 this
+        # gives the anchor an implicit advantage at argmax time that grows
+        # with λ. Registering a learnable scalar here lets CE place the
+        # anchor logit freely on the same scale as non-anchor programs.
+        # Default ``False`` preserves the old behaviour exactly (no new
+        # parameter, old checkpoints load without state-dict complaints).
+        self.use_anchor_bias = bool(use_anchor_bias)
+        if self.use_anchor_bias:
+            self.anchor_bias = nn.Parameter(torch.zeros(1))
+        else:
+            self.anchor_bias = None
         if self.use_pairs:
             self.pair_scorer: Optional[PairwiseScorer] = PairwiseScorer(
                 d_z=d,
@@ -771,6 +854,56 @@ class CompositionalRouter(nn.Module):
             )
         else:
             self.pair_scorer = None
+
+        # Precompute relation features for every unordered primitive pair
+        # (anchor-independent, data-independent, purely a function of
+        # ``primitives`` and ``num_positions``). Cached as a non-persistent
+        # buffer indexed by the flat key ``i * M + j`` so both
+        # :meth:`attach_pair_features` and :func:`local_moebius_loss` can
+        # index into the *same* tensor instead of recomputing on every
+        # batch. Fragility note in the old code: two independent CPU-side
+        # recomputations could drift if ``_primitives_list`` changes. With
+        # one shared buffer, there is a single source of truth.
+        M = len(self._primitives_list)
+        if M >= 2:
+            all_pairs = torch.tensor(
+                [(i, j) for i in range(M) for j in range(i + 1, M)],
+                dtype=torch.long,
+            )
+            rel_all = compute_pair_relation_features(
+                self._primitives_list, all_pairs,
+                num_positions=self.num_positions,
+            ).float()
+            flat_to_row = torch.full((M * M,), -1, dtype=torch.long)
+            for r, (i, j) in enumerate(all_pairs.tolist()):
+                flat_to_row[i * M + j] = r
+                flat_to_row[j * M + i] = r  # symmetric lookup
+        else:
+            rel_all = torch.zeros(0, N_RELATION_FEATURES, dtype=torch.float32)
+            flat_to_row = torch.zeros(max(1, M * M), dtype=torch.long)
+        self.register_buffer("_cached_rel_features", rel_all, persistent=False)
+        self.register_buffer("_rel_flat_to_row", flat_to_row, persistent=False)
+
+    def relation_features_for_pairs(
+        self,
+        i_idx: torch.Tensor,
+        j_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        """Look up cached relation features for a batch of primitive pairs.
+
+        ``i_idx`` and ``j_idx`` are long tensors of identical shape with
+        global primitive ids; the order (``i<j`` or otherwise) does not
+        matter because the cache is symmetric. Returns a float tensor of
+        shape ``[..., d_r]`` on the router's device.
+        """
+        if i_idx.numel() == 0:
+            return self._cached_rel_features.new_zeros(0, N_RELATION_FEATURES)
+        M = len(self._primitives_list)
+        flat = i_idx.long() * M + j_idx.long()
+        rows = self._rel_flat_to_row.index_select(0, flat.view(-1))
+        return self._cached_rel_features.index_select(0, rows).view(
+            *flat.shape, N_RELATION_FEATURES,
+        )
 
     @property
     def M(self) -> int:
@@ -860,17 +993,30 @@ class CompositionalRouter(nn.Module):
         lam: float,
         v_q: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return program_scores_with_pairs(
+        S = program_scores_with_pairs(
             s_q, v_q, catalogue.A, catalogue.B, catalogue.lengths, lam,
         )
+        if self.anchor_bias is not None and S.shape[1] > 0:
+            # Row 0 of the catalogue is the empty (anchor) program by
+            # construction in ``build_compositional_catalogues`` ("empty
+            # program first"). We add a single learnable scalar there.
+            S = S.clone()
+            S[:, 0] = S[:, 0] + self.anchor_bias.to(dtype=S.dtype)
+        return S
 
     def attach_pair_features(self, catalogues: Iterable[LegalCatalogue]) -> None:
-        """Materialise ``relation_features`` on each catalogue (anchor-independent)."""
+        """Materialise ``relation_features`` on each catalogue (anchor-independent).
+
+        Reads from :attr:`_cached_rel_features` so every pair-feature tensor
+        seen in the codebase (forward path, local Möbius loss,
+        per-catalogue cache) is a view into one consistent table.
+        """
         for cat in catalogues:
             if not cat.has_pairs or cat.relation_features is not None:
                 continue
-            rel = compute_pair_relation_features(
-                self._primitives_list, cat.pair_index, num_positions=self.num_positions,
+            pair_index = cat.pair_index.to(self._rel_flat_to_row.device)
+            rel = self.relation_features_for_pairs(
+                pair_index[:, 0], pair_index[:, 1],
             )
             cat.relation_features = rel.to(cat.A.device)
 
@@ -1005,11 +1151,13 @@ def local_moebius_loss(
             sym_sum = phi_i + phi_j
             sym_abs = (phi_i - phi_j).abs()
             sym_prod = phi_i * phi_j
-            ij_pair = torch.stack([i_idx, j_idx], dim=-1)  # already i<j
-            rel = compute_pair_relation_features(
-                router._primitives_list, ij_pair.detach().cpu(),
-                num_positions=router.num_positions,
-            ).to(device=g_q.device, dtype=g_q.dtype)
+            # Reuse the router's cached relation-feature table (same tensor
+            # used by ``PairwiseScorer.forward`` via ``attach_pair_features``),
+            # so the loss path cannot silently drift out of sync with the
+            # forward path and nothing is recomputed on CPU per batch.
+            rel = router.relation_features_for_pairs(i_idx, j_idx).to(
+                device=g_q.device, dtype=g_q.dtype,
+            )
             pair_feats = torch.cat(
                 [sym_sum, sym_abs, sym_prod, rel], dim=-1,
             )                                              # [N, 3 d_phi + d_r]
@@ -1080,6 +1228,12 @@ class CompositionalDataset(Dataset):
             if info is None:
                 logger.warning("[%s] missing manifest entry; skipping", bench)
                 continue
+            if bench in local_moebius_paths:
+                self.local_moebius_per_bench[bench] = self._load_local_moebius(
+                    local_moebius_paths[bench]
+                )
+            else:
+                self.local_moebius_per_bench[bench] = None
             if bench in observed_path_overrides:
                 obs_path = _Path(observed_path_overrides[bench])
             else:

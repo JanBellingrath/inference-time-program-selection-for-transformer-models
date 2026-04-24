@@ -95,6 +95,7 @@ SAVE_INTERVAL=50
 ADAPTER_PATH=""
 RESULTS_DIR="predictions/qwen25_0.5b_v2_sdpa"
 MAX_QUESTIONS=""
+SCORE_MODE="continuous"
 MIN_COUNT=50
 MIN_QUESTIONS=50
 INCLUDE_MOEBIUS=0
@@ -127,6 +128,7 @@ while [[ $# -gt 0 ]]; do
     --adapter_path)          ADAPTER_PATH="$2"; shift 2 ;;
     --results_dir)           RESULTS_DIR="$2"; shift 2 ;;
     --max_questions)         MAX_QUESTIONS="$2"; shift 2 ;;
+    --score_mode)            SCORE_MODE="$2"; shift 2 ;;
     --min_count)             MIN_COUNT="$2"; shift 2 ;;
     --min_questions)         MIN_QUESTIONS="$2"; shift 2 ;;
     --include_local_moebius) INCLUDE_MOEBIUS=1; shift ;;
@@ -380,6 +382,7 @@ for SPLIT in $SPLITS; do
         --batch_size '$BATCH_SIZE' \
         --save_interval '$SAVE_INTERVAL' \
         --gpu '$GPU' \
+        --score_mode '$SCORE_MODE' \
         ${ADAPTER_FLAG[*]:-} \
         ${MAX_Q_FLAG[*]:-}"
   fi

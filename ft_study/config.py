@@ -29,23 +29,51 @@ class ArmType(enum.Enum):
 
 @dataclass
 class SplitConfig:
-    """Proportions and minimum sizes for the four disjoint splits."""
+    """Sizes for the four splits.
+
+    New default scheme (post-2026-04 overhaul):
+        - ``test`` is the HF ``validation`` split of the dataset (with a
+          per-dataset fallback to a deterministic cut of HF ``train`` for
+          tasks that lack a labelled validation split, e.g. winogrande).
+        - From HF ``train`` we deterministically shuffle and split into:
+              val_select  = ``val_select_frac_of_train`` (default 2/9)
+              shared pool = the remaining 7/9, used as BOTH ``train_ft``
+                            (LoRA training data) AND ``val_search``
+                            (MCTS sample pool).  ``splits["train_ft"]``
+                            and ``splits["val_search"]`` reference the
+                            same list.
+
+    Layer ordering is a structural (architecture) choice rather than a
+    weight update, so reusing training data for search does not cause
+    overfitting of the kind that train/val separation is designed to
+    prevent.  This lets us hand both LoRA training and MCTS the maximum
+    possible amount of data while still holding out a clean ``val_select``
+    set for checkpoint / sequence selection and the HF ``validation`` split
+    as the truly held-out ``test`` set.
+
+    The legacy four-way fractional fields (``train_ft_frac`` etc.) are
+    retained only for backward compatibility with old configs and are no
+    longer consulted when ``use_hf_validation_as_test=True``.
+    """
+
+    val_select_frac_of_train: float = 2.0 / 9.0
+    use_hf_validation_as_test: bool = True
+
+    min_train_ft: int = 200
+    min_val_select: int = 50
+    min_test: int = 100
 
     train_ft_frac: float = 0.40
     val_search_frac: float = 0.25
     val_select_frac: float = 0.15
     test_frac: float = 0.20
 
-    min_train_ft: int = 200
-    min_val_search: int = 100
-    min_val_select: int = 50
-    min_test: int = 100
-
     def __post_init__(self):
-        total = (self.train_ft_frac + self.val_search_frac
-                 + self.val_select_frac + self.test_frac)
-        if abs(total - 1.0) > 1e-6:
-            raise ValueError(f"Split fractions must sum to 1.0, got {total}")
+        if not self.use_hf_validation_as_test:
+            total = (self.train_ft_frac + self.val_search_frac
+                     + self.val_select_frac + self.test_frac)
+            if abs(total - 1.0) > 1e-6:
+                raise ValueError(f"Split fractions must sum to 1.0, got {total}")
 
 
 # ---------------------------------------------------------------------------
@@ -58,10 +86,10 @@ class SearchConfig:
 
     num_simulations: int = 10_000
     eval_batch_size: int = 20
-    neighborhood_radius: int = 5
-    max_swaps: int = 24
+    neighborhood_radius: int = 3
+    max_swaps: int = 8
     exploration_constant: float = 1.8
-    random_prob: float = 0.1
+    random_prob: float = 0.05
     pw_C: float = 1.0
     pw_alpha: float = 0.5
     legacy_widen_prob: float = 0.0
@@ -70,20 +98,40 @@ class SearchConfig:
     validate_top_k: int = 3
     promote_delta: float = 0.0
 
-    # Internal tier sizes carved from val_search
-    tier2_samples: int = 100
-    tier3_samples: int = 500
-    tier4_samples: int = 1000
+    promote_use_wilson: bool = True
+    """When True, tier-2->tier-3 and tier-3->tier-4 promotion gates require
+    the candidate's Wilson lower bound to exceed the point baseline accuracy
+    (i.e. a more conservative, multiple-comparison-aware gate than ``delta>0``).
+    This sharply reduces winner's-curse selection of noise-driven tier-2
+    "winners" that fail to replicate on tier-3/4."""
+
+    rerank_topk: int = 5
+    """Post-MCTS, the runner re-evaluates the top-K validated candidates
+    (highest tier first) on ``val_select`` (TALE-style, 1-token grading) and
+    picks the one with the highest val_select accuracy as the final
+    ``best_seq``.  This is a held-out, dataset-internal Bayes-optimal pick
+    that mitigates winner's curse from tier-2/3/4 selection."""
+
+    # Internal tier sizes carved from the search pool (val_search or shared
+    # train_ft pool, depending on ``share_train_for_search``).
+    # ``tier4_samples = -1`` is a sentinel: use all remaining samples after
+    # tier2 + tier3 have been carved off (i.e. the entire remaining pool).
+    tier2_samples: int = 300
+    tier3_samples: int = 1500
+    tier4_samples: int = -1
 
     compute_loglik_full: bool = False
     """When False (default), skip full-sequence log-likelihood during MCTS
     evaluation.  Saves N_choices forward passes per sample (3-5x speedup).
     The MCTS reward uses only generative accuracy; loglik_full is informational."""
 
-    mcts_load_in_4bit: bool = True
+    mcts_load_in_4bit: bool = False
     """When True and ``FTConfig.load_in_4bit``, load the base model in 4-bit
     for MCTS (same NF4 as training). Avoids loading a second full fp16 copy
-    and prevents OOM on large models."""
+    and prevents OOM on large models.  Defaults to False so that base MCTS
+    runs in the same precision (fp16) as the held-out test evaluation,
+    eliminating quant-vs-fp16 mismatch as a source of non-transferring
+    "best" sequences."""
 
 
 # ---------------------------------------------------------------------------
@@ -96,8 +144,8 @@ class FTConfig:
 
     # LoRA
     lora_r: int = 64
-    lora_alpha: int = 16
-    lora_dropout: float = 0.1
+    lora_alpha: int = 64
+    lora_dropout: float = 0.05
     lora_target_modules: str = "all-linear"
 
     # Quantisation
@@ -117,7 +165,7 @@ class FTConfig:
     # Training loop
     num_train_epochs: int = 10
     per_device_train_batch_size: int = 2
-    gradient_accumulation_steps: int = 10
+    gradient_accumulation_steps: int = 16
     gradient_checkpointing: bool = True
     dataloader_num_workers: int = 4
     dataloader_drop_last: bool = True
@@ -172,7 +220,7 @@ class FTStudyConfig:
         "arc_easy", "arc_challenge", "mmlu", "commonsenseqa",
         "boolq", "winogrande",
     ])
-    seeds: List[int] = field(default_factory=lambda: [42, 1337, 2024])
+    seeds: List[int] = field(default_factory=lambda: [42, 43, 44])
     arms: List[ArmType] = field(default_factory=lambda: list(ArmType))
     gpu_rank: int = 0
 
@@ -180,23 +228,36 @@ class FTStudyConfig:
     search: SearchConfig = field(default_factory=SearchConfig)
     ft: FTConfig = field(default_factory=FTConfig)
 
+    ft_sweep_lrs: List[float] = field(
+        default_factory=lambda: [1e-5, 3e-5, 1e-4, 3e-4]
+    )
+    """Learning rates to sweep over during LoRA fine-tuning. Best LR per
+    seed is selected by val_select accuracy. The widened range below 1e-4
+    helps stabilise ft_only and reduces arm-to-arm noise from borderline
+    LR choices, which is one of the documented sources of variance in the
+    CSQA sweep."""
+
     output_dir: str = "ft_study_results"
     notify_signal: bool = False
 
     cached_sequences: Optional[dict] = field(default_factory=dict)
-    """Pre-computed best sequences per dataset from prior MCTS runs.
-    Maps dataset_name -> List[int].  When set, base-model search is
-    skipped and this sequence is used directly for search_ft and the
-    first phase of search_ft_search."""
+    """Pre-computed best sequences per (dataset, seed) from prior MCTS runs.
+    Maps ``(dataset_name, seed)`` -> ``List[int]``.  When set, base-model
+    search is skipped and this sequence is used directly for search_ft and
+    the first phase of search_ft_search.
 
-    share_train_for_search: bool = False
+    For backward compatibility, plain ``dataset_name`` keys are also accepted
+    and treated as seed-agnostic fallbacks."""
+
+    share_train_for_search: bool = True
     """When True, MCTS search evaluates candidates on the train_ft split
-    instead of the dedicated val_search split.  Layer ordering is a
-    structural (architecture) choice, not a weight update, so reusing
-    training data for search does not cause overfitting of the kind that
-    train/val separation is designed to prevent.  This gives search 2-4x
-    more evaluation samples, dramatically improving tier-promotion
-    statistical power."""
+    instead of the dedicated val_search split.  Under the new split scheme
+    train_ft and val_search are the same shared pool, so this primarily
+    controls naming/logging.  Layer ordering is a structural (architecture)
+    choice, not a weight update, so reusing training data for search does
+    not cause overfitting of the kind that train/val separation is designed
+    to prevent.  This gives search the maximum number of evaluation samples
+    available, dramatically improving tier-promotion statistical power."""
 
     @property
     def data_split_name(self) -> str:

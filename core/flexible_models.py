@@ -19,6 +19,7 @@ _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
 
 
 import logging
+import os
 from typing import Optional, List
 from functools import wraps
 
@@ -30,7 +31,142 @@ from transformers import (
     Qwen2ForCausalLM,
 )
 
+try:
+    from core.hf_hub_utils import (
+        from_pretrained_id_for_architecture,
+        resolve_pretrain_to_local_path,
+    )
+except Exception:
+    # Fallback for environments where helper module is not present.
+    # Keeps model loading functional by using the provided model id/path directly.
+    def resolve_pretrain_to_local_path(model_name: str) -> str:
+        return model_name
+
+    def from_pretrained_id_for_architecture(model_name_or_path: str) -> str:
+        return model_name_or_path
+
 logger = logging.getLogger(__name__)
+
+
+def _is_likely_network_error(exc: Exception) -> bool:
+    """Best-effort detection for transient HF Hub connectivity failures.
+
+    Walks exception causes/contexts because HF/transformers often wrap
+    network exceptions several levels deep.
+    """
+    msgs = []
+    cur = exc
+    seen = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        msgs.append(str(cur).lower())
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+    msg = " | ".join(msgs)
+    needles = (
+        "temporary failure in name resolution",
+        "name or service not known",
+        "failed to resolve",
+        "connection error",
+        "connecterror",
+        "max retries exceeded",
+        "nodename nor servname provided",
+        "network is unreachable",
+        "couldn't connect to 'https://huggingface.co'",
+        "cannot connect to host",
+        "connection timed out",
+        "read timed out",
+    )
+    return any(n in msg for n in needles)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _prefer_local_cache_only() -> bool:
+    """Whether to force local cache-only loading.
+
+    Triggered by standard HF offline env vars, and by our project-specific
+    opt-in var ``FT_STUDY_FORCE_LOCAL_ONLY``.
+    """
+    return (
+        _env_bool("HF_HUB_OFFLINE")
+        or _env_bool("TRANSFORMERS_OFFLINE")
+        or _env_bool("FT_STUDY_FORCE_LOCAL_ONLY")
+    )
+
+
+def _set_process_offline_mode() -> None:
+    """Flip process-level offline flags after a detected net failure."""
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+
+def _safe_tokenizer_from_pretrained(
+    resolved: str,
+    trust_remote_code: bool = True,
+):
+    """Load tokenizer and fall back to strict local-cache mode on net errors."""
+    if _prefer_local_cache_only():
+        logger.info(
+            "Loading tokenizer in local_files_only mode for %s (offline/local-cache requested).",
+            resolved,
+        )
+        return AutoTokenizer.from_pretrained(
+            resolved,
+            trust_remote_code=trust_remote_code,
+            local_files_only=True,
+        )
+    try:
+        return AutoTokenizer.from_pretrained(
+            resolved,
+            trust_remote_code=trust_remote_code,
+        )
+    except Exception as e:
+        if not _is_likely_network_error(e):
+            raise
+        logger.warning(
+            "Tokenizer load hit network error (%s). Retrying with local_files_only=True.",
+            e,
+        )
+        _set_process_offline_mode()
+        return AutoTokenizer.from_pretrained(
+            resolved,
+            trust_remote_code=trust_remote_code,
+            local_files_only=True,
+        )
+
+
+def _safe_model_from_pretrained(
+    ModelClass,
+    resolved: str,
+    **kwargs,
+):
+    """Load model and fall back to strict local-cache mode on net errors."""
+    if _prefer_local_cache_only():
+        local_kwargs = dict(kwargs)
+        local_kwargs["local_files_only"] = True
+        logger.info(
+            "Loading model in local_files_only mode for %s (offline/local-cache requested).",
+            resolved,
+        )
+        return ModelClass.from_pretrained(resolved, **local_kwargs)
+    try:
+        return ModelClass.from_pretrained(resolved, **kwargs)
+    except Exception as e:
+        if not _is_likely_network_error(e):
+            raise
+        logger.warning(
+            "Model load hit network error (%s). Retrying with local_files_only=True.",
+            e,
+        )
+        _set_process_offline_mode()
+        local_kwargs = dict(kwargs)
+        local_kwargs["local_files_only"] = True
+        return ModelClass.from_pretrained(resolved, **local_kwargs)
 
 
 def get_model_class(model_name: str):
@@ -224,21 +360,27 @@ def load_flexible_model(
         model.model.layer_indices = [0, 2, 1, 3, 5, 4, ...]
     """
     logger.info(f"Loading model: {model_name} on GPU {rank}")
-    
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name, 
-        trust_remote_code=trust_remote_code
+
+    resolved = resolve_pretrain_to_local_path(model_name)
+    arch_id = from_pretrained_id_for_architecture(resolved)
+    try:
+        ModelClass = get_model_class(arch_id)
+    except ValueError:
+        ModelClass = get_model_class(model_name)
+
+    # Load tokenizer from resolved path (local dir avoids hub metadata calls
+    # when the snapshot is already cached; critical for DNS-offline / flaky nets).
+    tokenizer = _safe_tokenizer_from_pretrained(
+        resolved, trust_remote_code=trust_remote_code,
     )
-    
+
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    
-    # Get model class and load
-    # Use eager attention to avoid flash_attn CUDA symbol issues
-    ModelClass = get_model_class(model_name)
-    model = ModelClass.from_pretrained(
-        model_name,
+
+    # Get model class and load; use eager attention to avoid flash_attn issues
+    model = _safe_model_from_pretrained(
+        ModelClass,
+        resolved,
         torch_dtype=dtype,
         device_map={"": f"cuda:{rank}"},
         trust_remote_code=trust_remote_code,
@@ -283,13 +425,19 @@ def load_flexible_model_quantized(
     """
     logger.info(f"Loading quantized model: {model_name} on GPU {rank}")
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name, trust_remote_code=trust_remote_code,
+    resolved = resolve_pretrain_to_local_path(model_name)
+    arch_id = from_pretrained_id_for_architecture(resolved)
+    try:
+        ModelClass = get_model_class(arch_id)
+    except ValueError:
+        ModelClass = get_model_class(model_name)
+
+    tokenizer = _safe_tokenizer_from_pretrained(
+        resolved, trust_remote_code=trust_remote_code,
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    ModelClass = get_model_class(model_name)
     kwargs: dict = {
         "device_map": {"": f"cuda:{rank}"},
         "trust_remote_code": trust_remote_code,
@@ -297,7 +445,7 @@ def load_flexible_model_quantized(
     }
     if bnb_config is not None:
         kwargs["quantization_config"] = bnb_config
-    model = ModelClass.from_pretrained(model_name, **kwargs)
+    model = _safe_model_from_pretrained(ModelClass, resolved, **kwargs)
 
     num_layers = len(model.model.layers)
     patch_model_for_flexible_layers(model)

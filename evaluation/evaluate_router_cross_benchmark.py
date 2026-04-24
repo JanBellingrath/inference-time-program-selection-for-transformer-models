@@ -159,6 +159,7 @@ def _load_compositional_router(
         pair_dropout=cfg.get("pair_dropout", 0.1),
         pair_zero_init=cfg.get("pair_zero_init", True),
         pair_topk_primitives=cfg.get("pair_topk_primitives"),
+        use_anchor_bias=cfg.get("use_anchor_bias", False),
     ).to(device)
     sd = payload.get("model_state_dict") or payload["state_dict"]
     router.load_state_dict(sd)

@@ -389,7 +389,16 @@ def collect_observed_for_benchmark(
                 stats["malformed_rows"] += 1
                 continue
             stats["rows_in"] += 1
-            row_to_delta: Dict[int, float] = {}
+            # Multiple canonicalisations (different MCTS playouts; struct +
+            # assign sources) can map to the *same* canonical program row
+            # with different per-playout ``delta`` readouts. The previous
+            # ``max(prev, delta)`` reduction was an upward-biased estimator
+            # of the true ``u(q, route) − u(q, anchor)`` and made "lucky"
+            # playouts dominate the CE-on-observed target. We accumulate
+            # ``(sum, count)`` and emit the sample mean, an unbiased
+            # estimator consistent with dense re-evaluation.
+            row_to_delta_sum: Dict[int, float] = {}
+            row_to_delta_count: Dict[int, int] = {}
             n_dropped = 0
             for entry in row.get("programs", []):
                 row_idx = _row_for_observed_program(entry, key_to_row)
@@ -400,12 +409,15 @@ def collect_observed_for_benchmark(
                     n_dropped += 1
                     continue
                 delta = float(entry.get("delta") or 0.0)
-                prev = row_to_delta.get(row_idx)
-                row_to_delta[row_idx] = delta if prev is None else max(prev, delta)
-            if not row_to_delta:
+                row_to_delta_sum[row_idx] = row_to_delta_sum.get(row_idx, 0.0) + delta
+                row_to_delta_count[row_idx] = row_to_delta_count.get(row_idx, 0) + 1
+            if not row_to_delta_sum:
                 stats["rows_without_observations"] += 1
                 continue
-            obs_pairs = sorted(row_to_delta.items())
+            obs_pairs = sorted(
+                (r, row_to_delta_sum[r] / max(row_to_delta_count[r], 1))
+                for r in row_to_delta_sum
+            )
             obs_indices = [r for r, _ in obs_pairs]
             obs_deltas = [d for _, d in obs_pairs]
             stats["rows_kept"] += 1

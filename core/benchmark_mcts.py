@@ -482,11 +482,15 @@ class BenchmarkMCTS:
                  extended_samples_tier4: Optional[List[Dict]] = None,
                  promote_delta: float = 0.0,
                  notify_signal: bool = True,
-                 compute_loglik_full: bool = False):
+                 compute_loglik_full: bool = False,
+                 promote_use_wilson: bool = False,
+                 rerank_topk: int = 5):
         self.model = model
         self.config = config
         self.notify_signal = notify_signal
         self.compute_loglik_full = compute_loglik_full
+        self.promote_use_wilson = promote_use_wilson
+        self.rerank_topk = rerank_topk
         self.samples = samples
         for s in self.samples:
             if "_hash" not in s:
@@ -1051,15 +1055,25 @@ class BenchmarkMCTS:
                 if self.notify_signal:
                     send_signal(msg)
 
-        # --- tier-3: promote candidates with positive delta to extended pool ---
+        # --- tier-3: promote candidates that beat baseline (gated) ---
         tier3_results = []
         if has_tier3:
-            promote = [r for r in validated_results if r["delta"] > self.promote_delta]
+            if self.promote_use_wilson:
+                promote = [r for r in validated_results if r["ci_lo"] > baseline_acc]
+            else:
+                promote = [r for r in validated_results if r["delta"] > self.promote_delta]
             if promote:
                 need3 = [r for r in promote if tuple(r["seq"]) not in self.validated_ext]
                 cached3 = len(promote) - len(need3)
-                thresh = f"{self.promote_delta:.0%}" if self.promote_delta > 0 else "0 (any positive)"
-                print(f"  [Tier-3] Promoting {len(promote)} candidates (delta>{thresh}) "
+                if self.promote_use_wilson:
+                    thresh_desc = f"Wilson CI_lo > baseline ({baseline_acc:.4f})"
+                else:
+                    thresh_desc = (
+                        f"delta>{self.promote_delta:.0%}"
+                        if self.promote_delta > 0
+                        else "delta>0 (any positive)"
+                    )
+                print(f"  [Tier-3] Promoting {len(promote)} candidates ({thresh_desc}) "
                       f"to {len(self.extended_samples)} samples "
                       f"({cached3} cached, {len(need3)} new)...", flush=True)
 
@@ -1135,13 +1149,24 @@ class BenchmarkMCTS:
                         if self.notify_signal:
                             send_signal(msg)
             else:
-                thresh = f"+{self.promote_delta:.0%}" if self.promote_delta > 0 else "positive"
-                print(f"  [Tier-3] No candidates with {thresh} delta.", flush=True)
+                if self.promote_use_wilson:
+                    thresh = f"Wilson CI_lo > baseline ({baseline_acc:.4f})"
+                else:
+                    thresh = (
+                        f"+{self.promote_delta:.0%}"
+                        if self.promote_delta > 0
+                        else "positive"
+                    )
+                print(f"  [Tier-3] No candidates passing {thresh}.", flush=True)
 
-        # --- tier-4: promote tier-3 candidates with positive delta to 1000-sample pool ---
+        # --- tier-4: promote tier-3 candidates that beat the tier-3 baseline ---
         tier4_results = []
         if has_tier4 and tier3_results:
-            promote4 = [r for r in tier3_results if r["delta"] > 0]
+            ext_base_for_gate = baseline_ext_acc if baseline_ext_acc is not None else baseline_acc
+            if self.promote_use_wilson:
+                promote4 = [r for r in tier3_results if r["ci_lo"] > ext_base_for_gate]
+            else:
+                promote4 = [r for r in tier3_results if r["delta"] > 0]
             if promote4:
                 need4 = [r for r in promote4 if tuple(r["seq"]) not in getattr(self, "validated_ext2", {})]
                 if not hasattr(self, "validated_ext2"):
@@ -1252,9 +1277,28 @@ class BenchmarkMCTS:
     def search(self, num_simulations: int, report_every: int = 50,
                validate_top_k: int = 3,
                out_prefix: Optional[str] = None,
-               resume_prefix: Optional[str] = None) -> Dict:
+               resume_prefix: Optional[str] = None,
+               default_seq: Optional[List[int]] = None) -> Dict:
+        """Run MCTS search.
+
+        Args:
+            default_seq: Anchor sequence for the search root.  When None, the
+                identity ``[0..n-1]`` order is used.  When set (e.g. the
+                pre-FT best sequence in ``search_ft_search`` phase 3), the
+                MCTS tree starts at that sequence and ``max_swaps`` counts
+                deviations from it; the same sequence is also used as the
+                comparison baseline for tier-2/3/4 deltas and for the
+                ``default_seq`` exclusion in noisy-better filtering.
+        """
         n = self.model.num_layers
-        default_seq = list(range(n))
+        if default_seq is None:
+            default_seq = list(range(n))
+        else:
+            default_seq = list(default_seq)
+            if len(default_seq) != n:
+                raise ValueError(
+                    f"default_seq length {len(default_seq)} != num_layers {n}"
+                )
         self.validated = {}      # tier-2: tuple(seq) -> {correct, total, accuracy, ci_lo, ci_hi}
         self.validated_ext = {}  # tier-3: tuple(seq) -> same
         self.validated_ext2 = {}  # tier-4: tuple(seq) -> same
@@ -1369,7 +1413,7 @@ class BenchmarkMCTS:
                            sim_start, len(self.stats), len(self.validated))
 
         # --- baseline accuracy on search samples (tier-2) ---
-        default_layers = list(range(n))
+        default_layers = seq_to_layers(default_seq)
         if not resume_mode:
             print(f"Computing baseline on {len(self.samples)} samples...", flush=True)
             bl_gen, bl_ln, bl_lf, _ = self._validate_sequence(default_layers, self.samples)
@@ -1435,7 +1479,11 @@ class BenchmarkMCTS:
                                    "loglik_full": e2lf / len(self.extended_samples_tier4)}
 
         # --- MCTS ---
-        root = BenchNode(default_seq, None, n, self.config.neighborhood_radius, self.config.max_swaps)
+        root = BenchNode(
+            list(default_seq), None, n,
+            self.config.neighborhood_radius, self.config.max_swaps,
+            anchor_seq=list(default_seq),
+        )
         c = self.config.exploration_constant
         sample_indices = list(range(len(self.samples)))
         if not resume_mode:
@@ -1621,6 +1669,24 @@ class BenchmarkMCTS:
         confirmed = [r for r in result_list if r["delta"] > 0 and r["seq"] != default_seq]
         sig = [r for r in confirmed if r["ci_lo"] > ref_ci[1]]
 
+        # Top-K candidates from the highest tier present, for downstream
+        # held-out re-ranking (winner's-curse mitigation).  Each entry is
+        # ``{"seq": [...], "tier": int, "tier_acc": float, "tier_n": int,
+        # "tier_ci_lo": float, "tier_ci_hi": float}``.
+        topk_tier = 4 if self.validated_ext2 else (3 if self.validated_ext else 2)
+        topk_list = [
+            {
+                "seq": r["seq"],
+                "tier": topk_tier,
+                "tier_acc": r["accuracy_gen"],
+                "tier_n": r["evaluated"],
+                "tier_ci_lo": r["ci_lo"],
+                "tier_ci_hi": r["ci_hi"],
+                "tier_delta": r["delta"],
+            }
+            for r in result_list[: max(1, self.rerank_topk)]
+        ]
+
         summary = {
             "baseline_accuracy_gen": baseline_acc,
             "baseline_accuracy_loglik_next": baseline_loglik["loglik_next"],
@@ -1646,6 +1712,7 @@ class BenchmarkMCTS:
             "dataset_is_mc": self.dataset_is_mc,
             "results": result_list,
             "best": confirmed[0] if confirmed else None,
+            "topk": topk_list,
             "config": {
                 "model_name": self.config.model_name,
                 "dataset": self.config.dataset,

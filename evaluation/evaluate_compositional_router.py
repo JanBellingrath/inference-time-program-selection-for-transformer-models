@@ -120,10 +120,11 @@ def load_router_from_checkpoint(
         pair_dropout=cfg.get("pair_dropout", 0.1),
         pair_zero_init=cfg.get("pair_zero_init", True),
         pair_topk_primitives=cfg.get("pair_topk_primitives"),
+        use_anchor_bias=cfg.get("use_anchor_bias", False),
     ).to(device)
     router.load_state_dict(payload["model_state_dict"])
     router.eval()
-    return router, cfg, benchmarks, bench_to_id
+    return router, cfg, benchmarks, bench_to_id, payload
 
 
 # ---------------------------------------------------------------------------
@@ -138,16 +139,83 @@ def _split_indices(n: int, val_fraction: float, seed: int) -> Tuple[List[int], L
     return perm[val_size:], perm[:val_size]
 
 
+def _select_indices_from_qids(
+    dataset: CompositionalDataset,
+    pairs: Sequence[Dict[str, Any]],
+    *,
+    benchmark_filter: Optional[str] = None,
+) -> List[int]:
+    """Resolve a list of ``{benchmark, question_id}`` pairs to dataset indices.
+
+    This is the *authoritative* routine used whenever a checkpoint carries
+    ``split_qids`` (written by ``training.train_compositional_router``).
+    Falls back to the legacy seeded ``randperm`` path below when a
+    checkpoint pre-dates this field.
+    """
+    lookup: Dict[Tuple[str, int], int] = {
+        (dataset.benchmark_names[i], int(dataset.question_ids[i])): i
+        for i in range(len(dataset))
+    }
+    out: List[int] = []
+    missing = 0
+    for p in pairs:
+        bench = str(p["benchmark"])
+        qid = int(p["question_id"])
+        if benchmark_filter is not None and bench != benchmark_filter:
+            continue
+        idx = lookup.get((bench, qid))
+        if idx is None:
+            missing += 1
+            continue
+        out.append(idx)
+    if missing:
+        logger.warning(
+            "split_qids: %d (bench, qid) pairs not found in current dataset "
+            "(may have been filtered by dense-delta availability).",
+            missing,
+        )
+    return out
+
+
 def _select_indices(
     dataset: CompositionalDataset,
     *,
     split: str,
     val_fraction: float,
     seed: int,
+    split_qids: Optional[Dict[str, Any]] = None,
+    benchmark_filter: Optional[str] = None,
 ) -> List[int]:
+    """Return dataset indices for the requested split.
+
+    When ``split_qids`` is provided (i.e. the checkpoint persisted the
+    training split as ``(benchmark, question_id)`` pairs), we resolve
+    those directly. This reproduces the *exact* train/val partition the
+    router was trained on — even when the evaluator's dataset only
+    contains one of several jointly trained benchmarks, where the legacy
+    seeded ``randperm`` approach produced a *different* random subset and
+    silently leaked train rows into "val".
+    """
     n = len(dataset)
     if split == "all":
         return list(range(n))
+    if split_qids is not None and split in ("internal_train", "internal_val"):
+        key = "train" if split == "internal_train" else "val"
+        pairs = split_qids.get(key) or []
+        idxs = _select_indices_from_qids(
+            dataset, pairs, benchmark_filter=benchmark_filter,
+        )
+        if not idxs:
+            logger.warning(
+                "split_qids resolved to 0 records for split=%s benchmark=%s; "
+                "falling back to legacy seeded randperm.",
+                split, benchmark_filter,
+            )
+        else:
+            return idxs
+    # Legacy fallback: reproducible only when the evaluator's dataset has
+    # the same size as training's dataset (i.e. single-benchmark training
+    # and single-benchmark evaluation).
     train_idx, val_idx = _split_indices(n, val_fraction, seed)
     if split == "internal_train":
         return train_idx
@@ -406,7 +474,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"benchmark {args.benchmark!r} missing from catalogue_dir manifest."
         )
 
-    router, cfg, benchmarks, bench_to_id = load_router_from_checkpoint(
+    router, cfg, benchmarks, bench_to_id, payload = load_router_from_checkpoint(
         args.checkpoint, artifacts, device,
     )
     lam = float(args.lam) if args.lam is not None else float(cfg.get("lam", 0.0))
@@ -425,8 +493,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if router.use_pairs:
         router.attach_pair_features([catalogue])
 
+    split_qids = payload.get("split_qids")
+    if split_qids is None and len(benchmarks) > 1 and args.split != "all":
+        logger.warning(
+            "Checkpoint does not carry split_qids (pre-fix payload) but was "
+            "trained jointly on %d benchmarks (%s); the legacy seeded "
+            "randperm will NOT reproduce the training split on a single "
+            "benchmark and may leak training rows into --split internal_val. "
+            "Consider retraining to get a reproducible split.",
+            len(benchmarks), benchmarks,
+        )
     indices = _select_indices(
         dataset, split=args.split, val_fraction=args.val_fraction, seed=args.seed,
+        split_qids=split_qids, benchmark_filter=args.benchmark,
     )
     logger.info(
         "Evaluating %d / %d records (split=%s, lam=%g, use_pairs=%s)",

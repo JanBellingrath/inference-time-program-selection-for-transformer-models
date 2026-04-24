@@ -1,0 +1,14 @@
+# Sequential job manifest for supervise_runs.sh.
+# Each line: NAME = COMMAND
+# Order matters; jobs run one after another, the next starts only after the
+# previous one finishes (success or final-failure).
+
+# 1) CSQA (non fine-tuned Qwen2.5-0.5B-Instruct):
+#    assign-extended dense increment (delta vs the existing 179-route struct
+#    matrix at dense_eval/csqa_compositional_179_train).
+csqa_nonft_assign_increment = CUDA_VISIBLE_DEVICES=1 PYTORCH_ALLOC_CONF=expandable_segments:True GPU=0 BATCH_SIZE=2 bash scripts/mine_csqa_nonft_assign_increment.sh
+
+# 2) Hellaswag (Qwen2.5-0.5B-Instruct, identity anchor):
+#    assign-extended dense increment (delta vs the existing 259-route struct
+#    matrix at compositional_runs/hellaswag_pipeline/dense/train).
+hellaswag_assign_increment = CUDA_VISIBLE_DEVICES=1 PYTORCH_ALLOC_CONF=expandable_segments:True GPU=0 BATCH_SIZE=4 bash scripts/mine_hellaswag_assign_increment.sh

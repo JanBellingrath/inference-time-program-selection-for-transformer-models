@@ -20,13 +20,14 @@ The searched object here is the architecture + scoring + optional pair head
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from ConfigSpace import (
     Categorical,
     ConfigurationSpace,
     Float,
     InCondition,
+    OrConjunction,
 )
 
 from experiments.unified_hpo.search_space import derive_hidden_dims
@@ -128,6 +129,45 @@ def build_configspace_compositional() -> ConfigurationSpace:
     # equivalent: gate on pair_depth, which itself is gated on use_pairs.
     cs.add(InCondition(pair_shrink, pair_depth, [2, 3]))
 
+    # === Optional Möbius local supervision =================================
+    # Local unary / pair Möbius targets add an auxiliary MSE loss whose
+    # targets decompose a program's observed uplift into per-primitive and
+    # per-pair contributions (``data_prep.build_local_moebius_targets``).
+    # Exposing these knobs to SMAC is what turns any statement like "HPO
+    # shows Möbius helps/hurts" from a spec-level claim into an empirical
+    # finding, because otherwise the HPO trial set is pinned at
+    # ``use_local_unary = use_local_pair = False`` (the pre-fix defaults in
+    # ``compositional_objective.train_and_score_compositional``).
+    #
+    # ``use_local_pair`` is meaningful only when ``use_pairs=True``
+    # (``local_moebius_loss`` short-circuits when ``router.pair_scorer`` is
+    # ``None``), so we gate it on ``use_pairs``.
+    #
+    # ``local_alpha`` scales the *total* local loss (unary + pair) and is
+    # only active when at least one of the two is on.
+    # ``local_pair_beta`` reweights the pair term relative to unary inside
+    # that total and is only active when ``use_local_pair`` is on.
+    use_local_unary = Categorical(
+        "use_local_unary", items=[True, False], default=False,
+    )
+    use_local_pair = Categorical(
+        "use_local_pair", items=[True, False], default=False,
+    )
+    local_alpha = Float(
+        "local_alpha", bounds=(1e-3, 1.0), default=1e-1, log=True,
+    )
+    local_pair_beta = Float(
+        "local_pair_beta", bounds=(1e-2, 10.0), default=1.0, log=True,
+    )
+    cs.add([use_local_unary, use_local_pair, local_alpha, local_pair_beta])
+
+    cs.add(InCondition(use_local_pair, use_pairs, [True]))
+    cs.add(OrConjunction(
+        InCondition(local_alpha, use_local_unary, [True]),
+        InCondition(local_alpha, use_local_pair, [True]),
+    ))
+    cs.add(InCondition(local_pair_beta, use_local_pair, [True]))
+
     # === Optimization ======================================================
 
     lr = Float("lr", bounds=(1e-4, 5e-3), default=1e-3, log=True)
@@ -178,6 +218,29 @@ def get_pair_topk_primitives(config: Dict) -> Optional[int]:
     if raw is None or raw == "all":
         return None
     return int(raw)
+
+
+def get_local_moebius_cfg(config: Dict) -> Dict[str, Any]:
+    """Resolve the active Möbius-supervision knobs from a SMAC config dict.
+
+    Conditional parameters are absent from ``config`` when inactive, so we
+    read them with ``.get`` and coerce everything to the types expected by
+    :func:`training.train_compositional_router.train_one_router`. Inactive
+    combinations collapse to ``use_local_* = False`` and ``local_alpha = 0``
+    (i.e. no auxiliary loss), matching the pre-HPO defaults.
+    """
+    use_pairs = bool(config.get("use_pairs", False))
+    use_local_unary = bool(config.get("use_local_unary", False))
+    use_local_pair = bool(config.get("use_local_pair", False)) and use_pairs
+    any_local = use_local_unary or use_local_pair
+    return {
+        "use_local_unary": use_local_unary,
+        "use_local_pair": use_local_pair,
+        "local_alpha": float(config.get("local_alpha", 0.0)) if any_local else 0.0,
+        "local_pair_beta": (
+            float(config.get("local_pair_beta", 1.0)) if use_local_pair else 1.0
+        ),
+    }
 
 
 def config_to_dict(config) -> Dict:

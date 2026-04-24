@@ -135,8 +135,14 @@ def _compute_program_scores_per_benchmark(
     if return_components:
         unary_g = torch.zeros(B, K, dtype=u_q.dtype, device=u_q.device)
         pair_g = torch.zeros(B, K, dtype=u_q.dtype, device=u_q.device)
-    pair_l2_acc: Optional[torch.Tensor] = None
-    pair_l2_count = 0
+    # Aggregate the L2 penalty in element space (sum of squares + element
+    # count) rather than as a mean of per-benchmark means. The latter
+    # under-weights large benchmarks in joint training and makes the
+    # reported "pair_l2_mean" depend on how many benchmarks happen to land
+    # in a given batch. The true mean-squared pair score over all ``v``
+    # elements seen in the batch is ``sum_sq / count``.
+    pair_l2_sum_sq: Optional[torch.Tensor] = None
+    pair_l2_count_n: int = 0
 
     unique_ids = torch.unique(benchmark_ids).tolist()
     for bid in unique_ids:
@@ -167,11 +173,18 @@ def _compute_program_scores_per_benchmark(
                     if catalogue.B.is_sparse else v_sub @ catalogue.B.t()
                 )                                              # [B', N_b]
                 S_sub = S_sub + pair_contrib
-                if pair_l2_acc is None:
-                    pair_l2_acc = (v_sub ** 2).mean()
+                sq_sum = (v_sub ** 2).sum()
+                if pair_l2_sum_sq is None:
+                    pair_l2_sum_sq = sq_sum
                 else:
-                    pair_l2_acc = pair_l2_acc + (v_sub ** 2).mean()
-                pair_l2_count += 1
+                    pair_l2_sum_sq = pair_l2_sum_sq + sq_sum
+                pair_l2_count_n += int(v_sub.numel())
+        # Anchor bias: row 0 is the empty program by catalogue construction.
+        # We mirror what ``router.program_scores`` does so the per-benchmark
+        # fast path stays consistent with the whole-catalogue path.
+        if router.anchor_bias is not None and S_sub.shape[1] > 0:
+            S_sub = S_sub.clone()
+            S_sub[:, 0] = S_sub[:, 0] + router.anchor_bias.to(dtype=S_sub.dtype)
         gather_idx = obs_indices.index_select(0, sample_idx).clamp(min=0)
         gathered_sub = S_sub.gather(1, gather_idx)
         gathered.index_copy_(0, sample_idx, gathered_sub)
@@ -181,8 +194,16 @@ def _compute_program_scores_per_benchmark(
                 pair_g.index_copy_(0, sample_idx, pair_contrib.gather(1, gather_idx))
 
     out = {"gathered": gathered}
-    if pair_l2_acc is not None and pair_l2_count > 0:
-        out["pair_l2_mean"] = pair_l2_acc / pair_l2_count
+    if pair_l2_sum_sq is not None and pair_l2_count_n > 0:
+        # ``pair_l2_mean`` is the per-batch mean over all individual pair
+        # scores; upstream epoch aggregation accumulates the sums and
+        # counts separately to avoid biasing by batch count when final
+        # batches are partial.
+        out["pair_l2_mean"] = pair_l2_sum_sq / float(pair_l2_count_n)
+        out["pair_l2_sum_sq"] = pair_l2_sum_sq.detach()
+        out["pair_l2_count"] = torch.tensor(
+            float(pair_l2_count_n), device=pair_l2_sum_sq.device,
+        )
     if return_components:
         out["unary_gathered"] = unary_g
         out["pair_gathered"] = pair_g  # zeros if pairs disabled or empty
@@ -235,6 +256,13 @@ def _loss_on_batch(
     out = {"loss": total, "ce": ce.detach()}
     if pair_reg is not None:
         out["pair_l2_mean"] = pair_reg.detach()
+        # Propagate the raw (sum_sq, count) so the epoch aggregator can
+        # compute the true element-wise mean over an epoch instead of a
+        # biased mean-of-batch-means.
+        if "pair_l2_sum_sq" in parts:
+            out["pair_l2_sum_sq"] = parts["pair_l2_sum_sq"]
+        if "pair_l2_count" in parts:
+            out["pair_l2_count"] = parts["pair_l2_count"]
 
     if (use_local_unary or use_local_pair) and local_alpha > 0:
         local_parts = local_moebius_loss(
@@ -459,8 +487,11 @@ def _epoch(
     router.train(mode=is_train)
     total_loss = 0.0
     total_ce = 0.0
-    total_pair_l2 = 0.0
-    n_pair_batches = 0
+    # Accumulate sum_sq and count across batches; reporting the ratio at
+    # epoch end gives the true mean-squared pair score over the epoch
+    # regardless of variable batch sizes / per-benchmark pair counts.
+    total_pair_l2_sum_sq = 0.0
+    total_pair_l2_count = 0
     sum_unary_abs = 0.0
     sum_pair_abs = 0.0
     n_components_batches = 0
@@ -485,9 +516,9 @@ def _epoch(
         bs = int(batch["benchmark_id"].numel())
         total_loss += float(loss.item()) * bs
         total_ce += float(out["ce"].item()) * bs
-        if "pair_l2_mean" in out:
-            total_pair_l2 += float(out["pair_l2_mean"].item())
-            n_pair_batches += 1
+        if "pair_l2_sum_sq" in out and "pair_l2_count" in out:
+            total_pair_l2_sum_sq += float(out["pair_l2_sum_sq"].item())
+            total_pair_l2_count += int(out["pair_l2_count"].item())
         if "local_unary" in out:
             sum_local_u += float(out["local_unary"].item())
             n_local_u += 1
@@ -507,8 +538,8 @@ def _epoch(
         "loss": total_loss / max(total_count, 1),
         "ce": total_ce / max(total_count, 1),
     }
-    if n_pair_batches > 0:
-        metrics["pair_l2_mean"] = total_pair_l2 / n_pair_batches
+    if total_pair_l2_count > 0:
+        metrics["pair_l2_mean"] = total_pair_l2_sum_sq / float(total_pair_l2_count)
     if n_local_u > 0:
         metrics["local_unary"] = sum_local_u / n_local_u
     if n_local_p > 0:
@@ -703,6 +734,7 @@ def train_one_router(
     use_full_sequence: bool = False,
     wandb_run: Optional[Any] = None,
     wandb_prefix: str = "",
+    wandb_step_offset: int = 0,
     use_pairs: bool = False,
     pair_hidden_dims: Sequence[int] = (96, 96),
     pair_dropout: float = 0.1,
@@ -712,6 +744,8 @@ def train_one_router(
     dense_delta_paths: Optional[Dict[str, _Path]] = None,
     use_dense_supervision: bool = False,
     downstream_eval_every: int = 1,
+    downstream_eval_subset: int = 0,
+    early_stopping_patience: int = 0,
     observed_path_overrides: Optional[Dict[str, _Path]] = None,
     dense_keep_mask_paths: Optional[Dict[str, _Path]] = None,
     local_moebius_paths: Optional[Dict[str, _Path]] = None,
@@ -719,9 +753,15 @@ def train_one_router(
     use_local_pair: bool = False,
     local_alpha: float = 0.0,
     local_pair_beta: float = 1.0,
+    checkpoint_metric: str = "loss",
+    use_anchor_bias: bool = False,
 ) -> Optional[Dict[str, Any]]:
     torch.manual_seed(seed)
     log_prefix = f"{wandb_prefix}/" if wandb_prefix else ""
+    # Monotonic W&B x-axis in multi-trial (single-run) HPO: parent passes
+    # trial_idx * stride so per-epoch steps never go backwards when a new trial
+    # resets epoch to 1.
+    wb = int(wandb_step_offset)
 
     bench_to_id = {b: i for i, b in enumerate(sorted(benchmarks))}
     dense_delta_paths = dict(dense_delta_paths or {})
@@ -750,6 +790,58 @@ def train_one_router(
     train_idx, val_idx = _split_indices(len(dataset), val_fraction, seed)
     train_subset = Subset(dataset, train_idx)
     val_subset = Subset(dataset, val_idx) if val_idx else None
+
+    # Optionally cap the *downstream* eval set to a fixed random subsample.
+    # Dense downstream metrics (``_downstream_metrics_on_split``) are the
+    # single most expensive thing in the epoch loop — each call runs a full
+    # router forward (including the pair MLP) on every question. For
+    # checkpoint selection we only need a reliable estimate of the true
+    # metric, so a few hundred held-out questions are plenty. The subsample
+    # is pinned by a seed so it is identical across all epochs / reruns
+    # with the same ``seed``, giving a smooth monotone view of progress.
+    eval_train_idx: Sequence[int] = train_idx
+    eval_val_idx: Sequence[int] = val_idx
+    if downstream_eval_subset and downstream_eval_subset > 0:
+        gen = torch.Generator().manual_seed(int(seed) * 997 + 13)
+        if len(train_idx) > downstream_eval_subset:
+            perm = torch.randperm(len(train_idx), generator=gen).tolist()
+            eval_train_idx = [train_idx[i] for i in perm[:downstream_eval_subset]]
+        if len(val_idx) > downstream_eval_subset:
+            perm = torch.randperm(len(val_idx), generator=gen).tolist()
+            eval_val_idx = [val_idx[i] for i in perm[:downstream_eval_subset]]
+        logger.info(
+            "downstream eval subsample: train=%d/%d  val=%d/%d  (seed-pinned)",
+            len(eval_train_idx), len(train_idx),
+            len(eval_val_idx), len(val_idx),
+        )
+
+    # Capture the (benchmark, question_id) pair for every index on each
+    # side of the split. Question IDs are stable across dataset
+    # reconstructions (they are the row's own ``question_id`` field), so
+    # persisting these pairs lets the evaluator reproduce the *exact*
+    # held-out set — including when the router is trained jointly across
+    # multiple benchmarks but evaluated on a single benchmark (the index
+    # universe changes from ``sum_b N_b`` to ``N_bench`` and the old
+    # ``torch.randperm`` approach picks a different subset, silently
+    # leaking train rows into "val"). The evaluator falls back to the
+    # legacy seeded randperm if ``split_qids`` is not present in the
+    # checkpoint (backward compatibility with older payloads).
+    def _pairs_for(ixs: Sequence[int]) -> List[Dict[str, Any]]:
+        return [
+            {
+                "benchmark": dataset.benchmark_names[i],
+                "question_id": int(dataset.question_ids[i]),
+            }
+            for i in ixs
+        ]
+
+    split_qids = {
+        "val_fraction": float(val_fraction),
+        "seed": int(seed),
+        "n_total": int(len(dataset)),
+        "train": _pairs_for(train_idx),
+        "val": _pairs_for(val_idx),
+    }
 
     train_loader = DataLoader(
         train_subset, batch_size=batch_size, shuffle=True,
@@ -790,6 +882,7 @@ def train_one_router(
         pair_dropout=pair_dropout,
         pair_zero_init=pair_zero_init,
         pair_topk_primitives=pair_topk_primitives,
+        use_anchor_bias=use_anchor_bias,
     ).to(device)
 
     catalogues_on_device = _move_catalogues(
@@ -813,10 +906,12 @@ def train_one_router(
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
 
-    best_val = float("inf")
+    best_val_loss_min = float("inf")
     best_epoch = -1
     best_state: Optional[Dict[str, torch.Tensor]] = None
     history: List[Dict[str, float]] = []
+    best_ckpt_score = float("inf") if checkpoint_metric == "loss" else float("-inf")
+    epochs_since_improve = 0
 
     for epoch in range(1, epochs + 1):
         train_metrics = _epoch(
@@ -845,17 +940,56 @@ def train_one_router(
             "train_loss": train_loss, "val_loss": val_loss,
             "train_ce": train_metrics["ce"], "val_ce": val_metrics_e["ce"],
         })
-        if val_loss < best_val:
-            best_val = val_loss
+        improved = False
+        if checkpoint_metric == "loss":
+            if val_loss < best_ckpt_score:
+                best_ckpt_score = val_loss
+                improved = True
+        elif checkpoint_metric == "mean_uplift":
+            if not has_dense:
+                raise SystemExit("--checkpoint_metric mean_uplift requires dense Δ matrices loaded.")
+            dm_val_ckpt = _downstream_metrics_on_split(
+                router, dataset, eval_val_idx, bench_id_to_catalogue, lam, device,
+            )
+            sc = float(dm_val_ckpt["mean_uplift"])
+            if sc > best_ckpt_score:
+                best_ckpt_score = sc
+                improved = True
+        elif checkpoint_metric == "dense_top1":
+            if not has_dense:
+                raise SystemExit("--checkpoint_metric dense_top1 requires dense Δ matrices loaded.")
+            dm_val_ckpt = _downstream_metrics_on_split(
+                router, dataset, eval_val_idx, bench_id_to_catalogue, lam, device,
+            )
+            sc = float(dm_val_ckpt["dense_top1_acc"])
+            if sc > best_ckpt_score:
+                best_ckpt_score = sc
+                improved = True
+        elif checkpoint_metric == "obs_top1":
+            rk_val = _ranking_metrics_on_split(
+                router, dataset, val_idx, bench_id_to_catalogue, lam, device,
+            )
+            sc = float(rk_val["obs_top1_acc"])
+            if sc > best_ckpt_score:
+                best_ckpt_score = sc
+                improved = True
+        else:
+            raise SystemExit(f"unknown --checkpoint_metric {checkpoint_metric!r}")
+        best_val_loss_min = min(best_val_loss_min, val_loss)
+        if improved:
             best_epoch = epoch
             best_state = {k: v.detach().cpu().clone() for k, v in router.state_dict().items()}
+            epochs_since_improve = 0
+        else:
+            epochs_since_improve += 1
         if wandb_run is not None:
             payload = {
                 f"{log_prefix}train/loss": train_loss,
                 f"{log_prefix}train/ce": train_metrics["ce"],
                 f"{log_prefix}val/loss": val_loss,
                 f"{log_prefix}val/ce": val_metrics_e["ce"],
-                f"{log_prefix}val/loss_best": best_val,
+                f"{log_prefix}val/loss_best": best_val_loss_min,
+                f"{log_prefix}val/checkpoint_best_score": best_ckpt_score,
                 f"{log_prefix}epoch": epoch,
                 f"{log_prefix}lr": optimizer.param_groups[0]["lr"],
             }
@@ -866,17 +1000,17 @@ def train_one_router(
                 ):
                     if key in mset:
                         payload[f"{log_prefix}{split}/{key}"] = mset[key]
-            wandb_run.log(payload, step=epoch)
+            wandb_run.log(payload, step=wb + epoch)
         if (
             has_dense
             and downstream_eval_every > 0
             and (epoch % downstream_eval_every == 0 or epoch == epochs)
         ):
             dm_train = _downstream_metrics_on_split(
-                router, dataset, train_idx, bench_id_to_catalogue, lam, device,
+                router, dataset, eval_train_idx, bench_id_to_catalogue, lam, device,
             )
             dm_val = _downstream_metrics_on_split(
-                router, dataset, val_idx, bench_id_to_catalogue, lam, device,
+                router, dataset, eval_val_idx, bench_id_to_catalogue, lam, device,
             )
             logger.info(
                 "Downstream  train: router=%.4f anchor=%.4f oracle=%.4f uplift=%+.4f frac_oracle=%.3f  "
@@ -892,7 +1026,7 @@ def train_one_router(
                     for k, v in m.items():
                         dpayload[f"{log_prefix}downstream/{split}/{k}"] = v
                 dpayload[f"{log_prefix}epoch"] = epoch
-                wandb_run.log(dpayload, step=epoch)
+                wandb_run.log(dpayload, step=wb + epoch)
         if epoch == 1 or epoch % 5 == 0 or epoch == epochs:
             extra = ""
             if "mean_abs_pair_contrib" in val_metrics_e:
@@ -901,9 +1035,24 @@ def train_one_router(
                     val_metrics_e["mean_abs_pair_contrib"],
                 )
             logger.info(
-                "Epoch %3d  train=%.4f  val=%.4f  (best=%d  val_best=%.4f)%s",
-                epoch, train_loss, val_loss, best_epoch, best_val, extra,
+                "Epoch %3d  train=%.4f  val=%.4f  (best_ep=%d  min_val_loss=%.4f  ckpt_%s=%.6f)%s",
+                epoch, train_loss, val_loss, best_epoch, best_val_loss_min,
+                checkpoint_metric, best_ckpt_score, extra,
             )
+        # Early stopping on the checkpoint metric. ``patience`` is the number
+        # of consecutive epochs with no improvement in ``best_ckpt_score``
+        # before we cut the run short. Running past best+patience is pure
+        # waste when the model has clearly plateaued / is overfitting.
+        if (
+            early_stopping_patience > 0
+            and epochs_since_improve >= early_stopping_patience
+            and best_epoch > 0
+        ):
+            logger.info(
+                "Early stop at epoch %d (no %s improvement for %d epochs; best was epoch %d, score=%.6f)",
+                epoch, checkpoint_metric, epochs_since_improve, best_epoch, best_ckpt_score,
+            )
+            break
 
     if best_state is None:
         best_state = {k: v.detach().cpu().clone() for k, v in router.state_dict().items()}
@@ -991,8 +1140,10 @@ def train_one_router(
                 for k, v in m.items():
                     flat[f"{log_prefix}downstream/{split}/{k}"] = v
         flat[f"{log_prefix}best_epoch"] = best_epoch
-        flat[f"{log_prefix}best_val_loss"] = best_val
-        wandb_run.log(flat, step=epochs)
+        flat[f"{log_prefix}best_val_loss"] = best_val_loss_min
+        flat[f"{log_prefix}best_checkpoint_metric"] = checkpoint_metric
+        flat[f"{log_prefix}best_checkpoint_score"] = best_ckpt_score
+        wandb_run.log(flat, step=wb + epochs)
 
     payload = {
         "model_state_dict": best_state,
@@ -1027,12 +1178,17 @@ def train_one_router(
             "use_local_pair": use_local_pair,
             "local_alpha": local_alpha,
             "local_pair_beta": local_pair_beta,
+            "checkpoint_metric": checkpoint_metric,
+            "use_anchor_bias": use_anchor_bias,
         },
         "benchmarks": list(benchmarks),
         "bench_to_id": bench_to_id,
+        "split_qids": split_qids,
         "history": history,
         "best_epoch": best_epoch,
-        "best_val_loss": best_val,
+        "best_val_loss": best_val_loss_min,
+        "best_checkpoint_metric": checkpoint_metric,
+        "best_checkpoint_score": best_ckpt_score,
         "metrics": {
             "train": train_metrics,
             "val": val_metrics,
@@ -1047,8 +1203,10 @@ def train_one_router(
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, output_path)
-    logger.info("checkpoint -> %s (best epoch %d, val_loss %.4f)",
-                output_path, best_epoch, best_val)
+    logger.info(
+        "checkpoint -> %s (best epoch %d, min_val_loss %.4f, ckpt_metric=%s score=%.6f)",
+        output_path, best_epoch, best_val_loss_min, checkpoint_metric, best_ckpt_score,
+    )
     return payload
 
 
@@ -1146,6 +1304,26 @@ def _build_argparser() -> argparse.ArgumentParser:
                    help="When dense deltas are loaded, supervise with full-N softmax CE.")
     p.add_argument("--downstream_eval_every", type=int, default=1,
                    help="Run dense downstream eval every N epochs (0 disables).")
+    p.add_argument("--downstream_eval_subset", type=int, default=0,
+                   help="If >0, cap dense downstream eval to this many randomly "
+                        "sampled questions per split (seed-pinned, stable across "
+                        "epochs). Applies to per-epoch checkpoint eval and to the "
+                        "periodic train+val logging eval. 0 means use the full split.")
+    p.add_argument("--early_stopping_patience", type=int, default=0,
+                   help="Stop training when the checkpoint metric has not improved "
+                        "for this many consecutive epochs. 0 disables early stopping.")
+    p.add_argument(
+        "--checkpoint_metric",
+        choices=["loss", "mean_uplift", "dense_top1", "obs_top1"],
+        default="loss",
+        help="Which validation signal selects the saved checkpoint (default: val CE loss).",
+    )
+    p.add_argument(
+        "--use_anchor_bias", action="store_true",
+        help="Add a learnable scalar to the anchor (row-0) program score. "
+             "Breaks the structural pinning S_q(anchor)≡0 and lets CE place "
+             "the anchor logit freely on the same scale as non-anchor programs.",
+    )
     p.add_argument("--device", default=None,
                    help="Override device (default: cuda if available, else cpu).")
     p.add_argument("--log_level", default="INFO")
@@ -1216,6 +1394,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raise SystemExit(f"--local_moebius_dir not a directory: {ldir}")
         for bench in artifacts.benchmarks:
             cand = ldir / f"{bench}.pt"
+            if not cand.is_file():
+                alt = ldir / f"local_moebius_{bench}.pt"
+                if alt.is_file():
+                    cand = alt
             if cand.is_file():
                 local_moebius_paths[bench] = cand
     if (args.use_local_unary or args.use_local_pair) and not local_moebius_paths:
@@ -1293,6 +1475,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dense_delta_paths=dense_paths,
         use_dense_supervision=bool(args.use_dense_supervision),
         downstream_eval_every=int(args.downstream_eval_every),
+        downstream_eval_subset=int(args.downstream_eval_subset),
+        early_stopping_patience=int(args.early_stopping_patience),
         observed_path_overrides=observed_overrides,
         dense_keep_mask_paths=dense_keep_paths,
         local_moebius_paths=local_moebius_paths,
@@ -1300,6 +1484,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         use_local_pair=bool(args.use_local_pair),
         local_alpha=float(args.local_alpha),
         local_pair_beta=float(args.local_pair_beta),
+        checkpoint_metric=str(args.checkpoint_metric),
+        use_anchor_bias=bool(args.use_anchor_bias),
     )
 
     try:

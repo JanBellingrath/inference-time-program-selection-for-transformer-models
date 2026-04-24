@@ -71,11 +71,16 @@ def _mcts_quantization_config(study_cfg: FTStudyConfig):
 
 
 def _effective_max_new_tokens(sample: Dict[str, Any], is_instruct: bool) -> int:
-    """Instruct chat models rarely emit the answer letter in a single BPE token."""
-    mt = int(sample.get("max_new_tokens", 1) or 1)
-    if is_instruct and sample.get("is_mc"):
-        return max(mt, 10)
-    return mt
+    """Return the per-sample ``max_new_tokens`` budget for evaluation.
+
+    The previous default forced instruct+MC samples up to ``>=10`` tokens to
+    "give the model space" to emit the answer letter, but that diverges from
+    the MCTS reward path which always uses 1-token TALE-style grading
+    (full-vocab argmax + ``grade_response``).  To keep search and eval on
+    the same protocol we now honour the dataset's per-sample
+    ``max_new_tokens`` (=1 for all MC tasks in ``prepare_arc_data``).
+    """
+    return int(sample.get("max_new_tokens", 1) or 1)
 
 
 def _get_inner_model(model):
@@ -98,24 +103,36 @@ DATASET_NAME_ALIASES = {
 def load_cached_sequences(
     search_dirs: List[str],
     dataset_names: Optional[List[str]] = None,
-) -> Dict[str, List[int]]:
+) -> Dict[Any, List[int]]:
     """Scan directories for ``benchmark_mcts_*.json`` and extract best sequences.
 
     For each dataset, picks the file with the latest timestamp (embedded in
     the filename).  Handles dataset-name aliases (e.g. ``mmlu`` → ``mmlu_all``).
+
+    File-name conventions recognised:
+        - ``benchmark_mcts_<dataset>_seed<seed>_<timestamp>.json`` (per-seed)
+        - ``benchmark_mcts_<dataset>_<timestamp>.json`` (legacy, dataset-only)
+
+    Per-seed entries populate keys ``(dataset_name, seed)``; legacy entries
+    populate keys ``dataset_name`` and act as seed-agnostic fallbacks.
 
     Args:
         search_dirs: Directories to scan for MCTS result JSON files.
         dataset_names: If provided, only load sequences for these datasets.
 
     Returns:
-        Dict mapping **study** dataset name → best layer sequence.
+        Dict whose keys are either ``str`` (legacy) or ``(str, int)``
+        (per-seed) and whose values are best layer sequences.
     """
     reverse_aliases = {}
     for study_name, mcts_name in DATASET_NAME_ALIASES.items():
         reverse_aliases.setdefault(mcts_name, []).append(study_name)
 
-    candidates: Dict[str, List[Tuple[str, str]]] = {}
+    import re as _re
+    seed_pat = _re.compile(r"^(?P<dataset>.+)_seed(?P<seed>\d+)$")
+
+    # candidates[(mcts_dataset, seed_or_None)] = [(timestamp, path), ...]
+    candidates: Dict[Tuple[str, Optional[int]], List[Tuple[str, str]]] = {}
 
     for d in search_dirs:
         pattern = os.path.join(d, "benchmark_mcts_*.json")
@@ -126,12 +143,21 @@ def load_cached_sequences(
             parts = base.replace("benchmark_mcts_", "").rsplit("_", 1)
             if len(parts) != 2:
                 continue
-            mcts_dataset = parts[0]
+            head = parts[0]
             timestamp = parts[1].replace(".json", "")
-            candidates.setdefault(mcts_dataset, []).append((timestamp, fpath))
+            m = seed_pat.match(head)
+            if m:
+                mcts_dataset = m.group("dataset")
+                seed_val: Optional[int] = int(m.group("seed"))
+            else:
+                mcts_dataset = head
+                seed_val = None
+            candidates.setdefault((mcts_dataset, seed_val), []).append(
+                (timestamp, fpath)
+            )
 
-    cached: Dict[str, List[int]] = {}
-    for mcts_dataset, entries in candidates.items():
+    cached: Dict[Any, List[int]] = {}
+    for (mcts_dataset, seed_val), entries in candidates.items():
         entries.sort(key=lambda x: x[0], reverse=True)
         latest_path = entries[0][1]
 
@@ -146,32 +172,87 @@ def load_cached_sequences(
                 best = data.get("best", {})
                 seq = best.get("seq")
                 if seq:
-                    cached[sname] = seq
+                    key: Any = (sname, seed_val) if seed_val is not None else sname
+                    cached[key] = seq
+                    tag = f"seed={seed_val}" if seed_val is not None else "seed-agnostic"
                     logger.info(
-                        "Cached sequence for %s from %s: %s (delta=%+.4f)",
-                        sname, latest_path, seq, best.get("delta", 0),
+                        "Cached sequence for %s (%s) from %s: %s (delta=%+.4f)",
+                        sname, tag, latest_path, seq, best.get("delta", 0),
                     )
             except Exception as e:
                 logger.warning("Failed to load cached sequence from %s: %s", latest_path, e)
 
         if mcts_dataset not in reverse_aliases:
             if not dataset_names or mcts_dataset in dataset_names:
-                if mcts_dataset not in cached:
+                key = (mcts_dataset, seed_val) if seed_val is not None else mcts_dataset
+                if key not in cached:
                     try:
                         with open(latest_path) as f:
                             data = json.load(f)
                         best = data.get("best", {})
                         seq = best.get("seq")
                         if seq:
-                            cached[mcts_dataset] = seq
+                            cached[key] = seq
                             logger.info(
                                 "Cached sequence for %s from %s: %s",
-                                mcts_dataset, latest_path, seq,
+                                key, latest_path, seq,
                             )
                     except Exception as e:
                         logger.warning("Failed to load %s: %s", latest_path, e)
 
     return cached
+
+
+def _lookup_cached_sequence(
+    cache: Dict[Any, List[int]],
+    dataset_name: str,
+    seed: int,
+) -> Optional[List[int]]:
+    """Look up a cached sequence honouring per-seed keys with seed-agnostic fallback."""
+    if not cache:
+        return None
+    key = (dataset_name, seed)
+    if key in cache:
+        return cache[key]
+    return cache.get(dataset_name)
+
+
+def _store_cached_sequence(
+    cache: Dict[Any, List[int]],
+    dataset_name: str,
+    seed: int,
+    seq: List[int],
+) -> None:
+    cache[(dataset_name, seed)] = seq
+
+
+def _persist_runtime_base_mcts_sequence(
+    study_cfg: "FTStudyConfig",
+    dataset_name: str,
+    seed: int,
+    seq: List[int],
+) -> None:
+    """Mirror the in-process runtime cache to disk so other processes / runs
+    can pick it up via ``load_cached_sequences``.
+
+    Files are named ``benchmark_mcts_<dataset>_seed<seed>_<timestamp>.json``
+    inside ``<output_dir>/base_mcts_cache/``.  Only a thin "best" record is
+    written (full snapshots stay under the per-arm directory).
+    """
+    base_dir = os.path.join(study_cfg.output_dir, "base_mcts_cache")
+    try:
+        os.makedirs(base_dir, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(
+            base_dir,
+            f"benchmark_mcts_{dataset_name}_seed{seed}_{ts}.json",
+        )
+        with open(path, "w") as f:
+            json.dump({"best": {"seq": seq, "delta": 0.0},
+                       "dataset": dataset_name, "seed": seed}, f, indent=2)
+        logger.info("Persisted base MCTS sequence to %s", path)
+    except Exception as e:
+        logger.warning("Failed to persist base MCTS sequence: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -328,10 +409,45 @@ def run_search_for_study(
     model_name: str,
     output_prefix: str,
     notify_signal: bool = False,
+    anchor_seq: Optional[List[int]] = None,
+    val_select_samples: Optional[List[Dict[str, Any]]] = None,
+    eval_model_for_rerank: Any = None,
+    eval_tokenizer_for_rerank: Any = None,
+    extra_rerank_candidates: Optional[List[List[int]]] = None,
 ) -> Tuple[Optional[List[int]], Dict[str, Any]]:
-    """Run MCTS search using val_search data and return (best_sequence, summary).
+    """Run MCTS search and return (best_sequence, summary).
 
-    If no sequence beats baseline, returns the default sequence.
+    Args:
+        mcts_model: An object exposing ``.wrapper.model`` / ``.wrapper.tokenizer``
+            and ``.num_layers`` (e.g. ``MCTSModel`` or ``_MCTSModelFromLoaded``).
+        val_search_samples: Sample pool for tier-2/3/4 (carved internally).
+        search_cfg: ``SearchConfig`` with all MCTS / rerank hyperparameters.
+        dataset_name: Used by ``grade_response`` to pick the grading rule.
+        model_name: HF model id for instruct/chat-template detection.
+        output_prefix: Where to persist snapshots / explored logs.
+        notify_signal: Forward to ``BenchmarkMCTS`` for Signal notifications.
+        anchor_seq: Optional anchor for the MCTS root.  When provided, the
+            tree is anchored at this sequence and tier-2/3/4 baselines are
+            measured for it (instead of the identity order).  Used by
+            ``search_ft_search`` phase 3 to pass the pre-FT best sequence.
+        val_select_samples: When non-empty AND a working evaluation model is
+            supplied, the top-``rerank_topk`` MCTS candidates are re-evaluated
+            on this held-out pool (TALE-style 1-token grading) and the one
+            with the highest val_select accuracy is returned as ``best_seq``.
+            This is the post-MCTS winner's-curse mitigation step.
+        eval_model_for_rerank: HF model used for the val_select re-rank
+            evaluation.  For base-model search, pass ``mcts_model.wrapper.model``.
+            For post-FT search, pass the loaded FT model (e.g.
+            ``ft_mcts.wrapper.model``).
+        eval_tokenizer_for_rerank: Matching tokenizer.
+        extra_rerank_candidates: Additional sequences to inject into the
+            rerank candidate pool (e.g. the pre-FT sequence in phase 3).
+
+    Returns ``(best_seq, summary)``.  If the post-MCTS rerank picks a
+    different sequence than the tier-best, ``summary["rerank"]`` will hold
+    the rerank trace and ``best_seq`` reflects the rerank winner.  If no
+    sequence beats baseline (and no rerank winner emerges), the anchor (or
+    identity) sequence is returned.
     """
     t2, t3, t4 = split_val_search_into_tiers(
         val_search_samples,
@@ -365,6 +481,8 @@ def run_search_for_study(
         promote_delta=search_cfg.promote_delta,
         notify_signal=notify_signal,
         compute_loglik_full=search_cfg.compute_loglik_full,
+        promote_use_wilson=search_cfg.promote_use_wilson,
+        rerank_topk=search_cfg.rerank_topk,
     )
     resume_prefix: Optional[str] = None
     snap_path = f"{output_prefix}_snapshot.json"
@@ -378,14 +496,77 @@ def run_search_for_study(
         validate_top_k=search_cfg.validate_top_k,
         out_prefix=output_prefix,
         resume_prefix=resume_prefix,
+        default_seq=anchor_seq,
     )
 
     best = summary.get("best")
+    fallback_seq = list(anchor_seq) if anchor_seq else list(range(mcts_model.num_layers))
     if best and best.get("seq"):
         best_seq = best["seq"]
     else:
-        best_seq = list(range(mcts_model.num_layers))
-        logger.info("No sequence beat baseline; using default order")
+        best_seq = fallback_seq
+        logger.info("No sequence beat baseline; using anchor/default order")
+
+    rerank_trace: Optional[Dict[str, Any]] = None
+    if (
+        val_select_samples
+        and eval_model_for_rerank is not None
+        and eval_tokenizer_for_rerank is not None
+    ):
+        candidates: List[Dict[str, Any]] = []
+        seen_keys: set = set()
+
+        def _add(seq: List[int], source: str, extra: Optional[Dict[str, Any]] = None):
+            key = tuple(seq)
+            if key in seen_keys:
+                return
+            seen_keys.add(key)
+            entry = {"seq": list(seq), "source": source}
+            if extra:
+                entry.update(extra)
+            candidates.append(entry)
+
+        for entry in summary.get("topk", []) or []:
+            _add(entry["seq"], "mcts_topk", {
+                "tier": entry.get("tier"),
+                "tier_acc": entry.get("tier_acc"),
+                "tier_n": entry.get("tier_n"),
+                "tier_ci_lo": entry.get("tier_ci_lo"),
+                "tier_ci_hi": entry.get("tier_ci_hi"),
+            })
+        _add(fallback_seq, "anchor_or_identity")
+        if extra_rerank_candidates:
+            for s in extra_rerank_candidates:
+                _add(list(s), "extra")
+
+        num_layers = mcts_model.num_layers
+        for c in candidates:
+            metrics = evaluate_on_test(
+                eval_model_for_rerank,
+                eval_tokenizer_for_rerank,
+                c["seq"], val_select_samples,
+                dataset_name, model_name, num_layers,
+            )
+            c["val_select_acc"] = metrics["test_metric"]
+            c["val_select_n"] = metrics["test_total"]
+
+        candidates.sort(key=lambda r: r["val_select_acc"], reverse=True)
+        rerank_winner = candidates[0]
+        best_seq = rerank_winner["seq"]
+        rerank_trace = {"candidates": candidates, "winner_seq": best_seq}
+        summary["rerank"] = rerank_trace
+        if output_prefix:
+            try:
+                with open(f"{output_prefix}_rerank.json", "w") as f:
+                    json.dump(rerank_trace, f, indent=2, default=str)
+            except Exception as e:
+                logger.warning("Failed to persist rerank trace: %s", e)
+        logger.info(
+            "Post-MCTS rerank on val_select (n=%d) picked %s "
+            "(acc=%.4f) from %d candidates",
+            len(val_select_samples), rerank_winner.get("source"),
+            rerank_winner["val_select_acc"], len(candidates),
+        )
 
     return best_seq, summary
 
@@ -422,6 +603,8 @@ def evaluate_on_test(
     correct_count = 0
     total = len(test_samples)
     total_eval_time = 0.0
+    per_example: List[Dict[str, Any]] = []
+    correct_by_idx: Dict[int, bool] = {}
 
     def _prepare_prompt(sample):
         if is_instruct:
@@ -467,14 +650,17 @@ def evaluate_on_test(
                             fwd_kw["use_cache"] = False
                         out = model(**inputs, **fwd_kw)
                         token_ids = out.logits[:, -1, :].argmax(dim=-1)
-                        for j, (_, sample) in enumerate(batch):
+                        for j, (orig_idx, sample) in enumerate(batch):
                             resp = tokenizer.decode(
                                 [token_ids[j].item()], skip_special_tokens=True,
                             ).strip()
-                            if grade_response(resp, sample["correct"],
-                                              dataset_name, model_name,
-                                              sample["input"]) > 0.5:
+                            ok = grade_response(
+                                resp, sample["correct"],
+                                dataset_name, model_name, sample["input"],
+                            ) > 0.5
+                            if ok:
                                 correct_count += 1
+                            correct_by_idx[orig_idx] = ok
                     else:
                         gen_kw = {
                             "max_new_tokens": max_tok,
@@ -485,14 +671,17 @@ def evaluate_on_test(
                             gen_kw["use_cache"] = False
                         outputs = model.generate(**inputs, **gen_kw)
                         input_len = inputs.input_ids.shape[1]
-                        for j, (_, sample) in enumerate(batch):
+                        for j, (orig_idx, sample) in enumerate(batch):
                             resp = tokenizer.decode(
                                 outputs[j][input_len:], skip_special_tokens=True,
                             ).strip()
-                            if grade_response(resp, sample["correct"],
-                                              dataset_name, model_name,
-                                              sample["input"]) > 0.5:
+                            ok = grade_response(
+                                resp, sample["correct"],
+                                dataset_name, model_name, sample["input"],
+                            ) > 0.5
+                            if ok:
                                 correct_count += 1
+                            correct_by_idx[orig_idx] = ok
                 total_eval_time += time.time() - t0
     finally:
         if saved is not None:
@@ -502,12 +691,19 @@ def evaluate_on_test(
     mean_lat = total_eval_time / total if total else 0.0
     throughput = total / total_eval_time if total_eval_time else 0.0
 
+    for i, sample in enumerate(test_samples):
+        per_example.append({
+            "sample_hash": sample.get("_hash") or "",
+            "correct": bool(correct_by_idx.get(i, False)),
+        })
+
     return {
         "test_metric": accuracy,
         "test_correct": correct_count,
         "test_total": total,
         "inference_latency_per_example_s": mean_lat,
         "throughput_examples_per_s": throughput,
+        "per_example": per_example,
     }
 
 
@@ -566,11 +762,12 @@ def _run_ft_only(
     test_metrics = evaluate_on_test(
         model, tokenizer, default_seq, splits["test"], dataset_name, model_name, num_layers,
     )
+    test_per_example = test_metrics.pop("per_example", [])
 
-    # Val-select accuracy
     val_metrics = evaluate_on_test(
         model, tokenizer, default_seq, splits["val_select"], dataset_name, model_name, num_layers,
     )
+    val_select_per_example = val_metrics.pop("per_example", [])
 
     del model
     torch.cuda.empty_cache()
@@ -586,6 +783,8 @@ def _run_ft_only(
         "total_tokens": train_result.total_tokens,
         **_seq_metrics(default_seq, num_layers),
         "adapter_path": train_result.adapter_dir,
+        "test_per_example": test_per_example,
+        "val_select_per_example": val_select_per_example,
     }
     return result
 
@@ -601,11 +800,19 @@ def _run_search_ft(
     """Arm 2: Search on frozen base -> fine-tune under best sequence."""
     set_seed(seed)
 
-    cached_seq = study_cfg.cached_sequences.get(dataset_name)
+    cached_seq = _lookup_cached_sequence(
+        study_cfg.cached_sequences or {}, dataset_name, seed,
+    )
     if cached_seq is None:
-        cached_seq = getattr(study_cfg, '_runtime_search_cache', {}).get(dataset_name)
+        cached_seq = _lookup_cached_sequence(
+            getattr(study_cfg, '_runtime_search_cache', {}) or {},
+            dataset_name, seed,
+        )
     if cached_seq is not None:
-        logger.info("Using cached base-model sequence for %s: %s", dataset_name, cached_seq)
+        logger.info(
+            "Using cached base-model sequence for %s seed=%d: %s",
+            dataset_name, seed, cached_seq,
+        )
         best_seq = cached_seq
         search_wall = 0.0
         num_layers = len(cached_seq)
@@ -618,39 +825,67 @@ def _run_search_ft(
             bnb_config=_mcts_quantization_config(study_cfg),
         )
         num_layers = mcts_model.num_layers
-        search_prefix = os.path.join(arm_dir, f"search_base_{dataset_name}")
+        search_prefix = os.path.join(
+            arm_dir, f"search_base_{dataset_name}_seed{seed}",
+        )
 
         search_pool = _get_search_samples(splits, study_cfg)
         best_seq, search_summary = run_search_for_study(
             mcts_model, search_pool, study_cfg.search,
             dataset_name, model_name, search_prefix,
             notify_signal=study_cfg.notify_signal,
+            val_select_samples=splits.get("val_select"),
+            eval_model_for_rerank=mcts_model.wrapper.model,
+            eval_tokenizer_for_rerank=mcts_model.wrapper.tokenizer,
         )
         search_wall = search_summary.get("elapsed_seconds", 0)
+
+        _persist_runtime_base_mcts_sequence(
+            study_cfg, dataset_name, seed, best_seq,
+        )
 
         del mcts_model
         torch.cuda.empty_cache()
 
     if not hasattr(study_cfg, '_runtime_search_cache'):
         study_cfg._runtime_search_cache = {}
-    study_cfg._runtime_search_cache[dataset_name] = best_seq
+    _store_cached_sequence(
+        study_cfg._runtime_search_cache, dataset_name, seed, best_seq,
+    )
 
     # -- Fine-tune under best sequence --
     active_layers = seq_to_layers(best_seq)
-    peft_model, tokenizer, _, effective_seq = load_model_for_ft(
-        model_name, study_cfg.ft, layer_sequence=active_layers, rank=study_cfg.gpu_rank,
-    )
-    train_ds = splits.get("_train_ds") or make_sft_dataset(splits["train_ft"], tokenizer)
-    val_ds = splits.get("_val_ds") or make_sft_dataset(splits["val_select"], tokenizer)
-    train_result = train_lora(
-        peft_model, tokenizer, train_ds, val_ds, study_cfg.ft,
-        output_dir=os.path.join(arm_dir, "checkpoints"),
-        run_name=f"search_ft_{dataset_name}_s{seed}",
-        layer_sequence=effective_seq, num_layers=num_layers,
-    )
+    ckpt_dir = os.path.join(arm_dir, "checkpoints")
+    adapter_dir = os.path.join(ckpt_dir, "final_adapter")
+    adapter_ready = os.path.isfile(os.path.join(adapter_dir, "adapter_config.json"))
+    if adapter_ready:
+        logger.info(
+            "search_ft: reusing existing adapter at %s (resume/continue mode)",
+            adapter_dir,
+        )
+        train_result = TrainResult(
+            best_checkpoint_dir=adapter_dir,
+            adapter_dir=adapter_dir,
+            train_wall_clock_s=0.0,
+            peak_gpu_memory_gb=0.0,
+            trainable_params=0,
+            total_tokens=0,
+        )
+    else:
+        peft_model, tokenizer, _, effective_seq = load_model_for_ft(
+            model_name, study_cfg.ft, layer_sequence=active_layers, rank=study_cfg.gpu_rank,
+        )
+        train_ds = splits.get("_train_ds") or make_sft_dataset(splits["train_ft"], tokenizer)
+        val_ds = splits.get("_val_ds") or make_sft_dataset(splits["val_select"], tokenizer)
+        train_result = train_lora(
+            peft_model, tokenizer, train_ds, val_ds, study_cfg.ft,
+            output_dir=ckpt_dir,
+            run_name=f"search_ft_{dataset_name}_s{seed}",
+            layer_sequence=effective_seq, num_layers=num_layers,
+        )
 
-    del peft_model
-    torch.cuda.empty_cache()
+        del peft_model
+        torch.cuda.empty_cache()
 
     # -- Evaluate --
     model, tokenizer, _ = load_ft_model_for_inference(
@@ -661,9 +896,11 @@ def _run_search_ft(
     test_metrics = evaluate_on_test(
         model, tokenizer, best_seq, splits["test"], dataset_name, model_name, num_layers,
     )
+    test_per_example = test_metrics.pop("per_example", [])
     val_metrics = evaluate_on_test(
         model, tokenizer, best_seq, splits["val_select"], dataset_name, model_name, num_layers,
     )
+    val_select_per_example = val_metrics.pop("per_example", [])
 
     del model
     torch.cuda.empty_cache()
@@ -681,6 +918,8 @@ def _run_search_ft(
         "total_tokens": train_result.total_tokens,
         **_seq_metrics(best_seq, num_layers),
         "adapter_path": train_result.adapter_dir,
+        "test_per_example": test_per_example,
+        "val_select_per_example": val_select_per_example,
     }
     return result
 
@@ -747,16 +986,18 @@ def _run_ft_search(
         rank=study_cfg.gpu_rank,
     )
     num_layers = ft_mcts.num_layers
-    search_prefix = os.path.join(arm_dir, f"search_ft_{dataset_name}")
+    search_prefix = os.path.join(arm_dir, f"search_ft_{dataset_name}_seed{seed}")
     search_pool = _search_pool_for_ft_search(dataset_name, splits, study_cfg)
     best_seq, search_summary = run_search_for_study(
         ft_mcts, search_pool, study_cfg.search,
         dataset_name, model_name, search_prefix,
         notify_signal=study_cfg.notify_signal,
+        val_select_samples=splits.get("val_select"),
+        eval_model_for_rerank=ft_mcts.wrapper.model,
+        eval_tokenizer_for_rerank=ft_mcts.wrapper.tokenizer,
     )
     search_wall = search_summary.get("elapsed_seconds", 0)
 
-    # Evaluate using the ft model that is already loaded inside ft_mcts
     active_layers = seq_to_layers(best_seq)
     ft_mcts.wrapper.model.model.layer_indices = active_layers
 
@@ -764,10 +1005,12 @@ def _run_ft_search(
         ft_mcts.wrapper.model, ft_mcts.wrapper.tokenizer,
         best_seq, splits["test"], dataset_name, model_name, num_layers,
     )
+    test_per_example = test_metrics.pop("per_example", [])
     val_metrics = evaluate_on_test(
         ft_mcts.wrapper.model, ft_mcts.wrapper.tokenizer,
         best_seq, splits["val_select"], dataset_name, model_name, num_layers,
     )
+    val_select_per_example = val_metrics.pop("per_example", [])
 
     del ft_mcts
     torch.cuda.empty_cache()
@@ -786,6 +1029,8 @@ def _run_ft_search(
         **_seq_metrics(best_seq, num_layers),
         "post_ft_best_sequence": best_seq,
         "adapter_path": train_result.adapter_dir,
+        "test_per_example": test_per_example,
+        "val_select_per_example": val_select_per_example,
     }
     return result
 
@@ -802,11 +1047,19 @@ def _run_search_ft_search(
     set_seed(seed)
 
     # -- Phase 1: search on base model (use cache if available) --
-    cached_seq = study_cfg.cached_sequences.get(dataset_name)
+    cached_seq = _lookup_cached_sequence(
+        study_cfg.cached_sequences or {}, dataset_name, seed,
+    )
     if cached_seq is None:
-        cached_seq = getattr(study_cfg, '_runtime_search_cache', {}).get(dataset_name)
+        cached_seq = _lookup_cached_sequence(
+            getattr(study_cfg, '_runtime_search_cache', {}) or {},
+            dataset_name, seed,
+        )
     if cached_seq is not None:
-        logger.info("Using cached base-model sequence for %s: %s", dataset_name, cached_seq)
+        logger.info(
+            "Using cached base-model sequence for %s seed=%d: %s",
+            dataset_name, seed, cached_seq,
+        )
         pre_ft_seq = cached_seq
         search1_wall = 0.0
         num_layers = len(cached_seq)
@@ -819,51 +1072,92 @@ def _run_search_ft_search(
             bnb_config=_mcts_quantization_config(study_cfg),
         )
         num_layers = mcts_model.num_layers
-        search1_prefix = os.path.join(arm_dir, f"search1_base_{dataset_name}")
+        search1_prefix = os.path.join(
+            arm_dir, f"search1_base_{dataset_name}_seed{seed}",
+        )
 
         search_pool = _get_search_samples(splits, study_cfg)
         pre_ft_seq, search1_summary = run_search_for_study(
             mcts_model, search_pool, study_cfg.search,
             dataset_name, model_name, search1_prefix,
             notify_signal=study_cfg.notify_signal,
+            val_select_samples=splits.get("val_select"),
+            eval_model_for_rerank=mcts_model.wrapper.model,
+            eval_tokenizer_for_rerank=mcts_model.wrapper.tokenizer,
         )
         search1_wall = search1_summary.get("elapsed_seconds", 0)
+
+        _persist_runtime_base_mcts_sequence(
+            study_cfg, dataset_name, seed, pre_ft_seq,
+        )
+
+        if not hasattr(study_cfg, '_runtime_search_cache'):
+            study_cfg._runtime_search_cache = {}
+        _store_cached_sequence(
+            study_cfg._runtime_search_cache, dataset_name, seed, pre_ft_seq,
+        )
 
         del mcts_model
         torch.cuda.empty_cache()
 
     # -- Phase 2: fine-tune under pre-FT best sequence --
     active_layers = seq_to_layers(pre_ft_seq)
-    peft_model, tokenizer, _, effective_seq = load_model_for_ft(
-        model_name, study_cfg.ft, layer_sequence=active_layers, rank=study_cfg.gpu_rank,
-    )
-    train_ds = splits.get("_train_ds") or make_sft_dataset(splits["train_ft"], tokenizer)
-    val_ds = splits.get("_val_ds") or make_sft_dataset(splits["val_select"], tokenizer)
-    train_result = train_lora(
-        peft_model, tokenizer, train_ds, val_ds, study_cfg.ft,
-        output_dir=os.path.join(arm_dir, "checkpoints"),
-        run_name=f"sfs_{dataset_name}_s{seed}",
-        layer_sequence=effective_seq, num_layers=num_layers,
-    )
+    ckpt_dir = os.path.join(arm_dir, "checkpoints")
+    adapter_dir = os.path.join(ckpt_dir, "final_adapter")
+    adapter_ready = os.path.isfile(os.path.join(adapter_dir, "adapter_config.json"))
+    if adapter_ready:
+        logger.info(
+            "search_ft_search: reusing existing adapter at %s (resume/continue mode)",
+            adapter_dir,
+        )
+        train_result = TrainResult(
+            best_checkpoint_dir=adapter_dir,
+            adapter_dir=adapter_dir,
+            train_wall_clock_s=0.0,
+            peak_gpu_memory_gb=0.0,
+            trainable_params=0,
+            total_tokens=0,
+        )
+    else:
+        peft_model, tokenizer, _, effective_seq = load_model_for_ft(
+            model_name, study_cfg.ft, layer_sequence=active_layers, rank=study_cfg.gpu_rank,
+        )
+        train_ds = splits.get("_train_ds") or make_sft_dataset(splits["train_ft"], tokenizer)
+        val_ds = splits.get("_val_ds") or make_sft_dataset(splits["val_select"], tokenizer)
+        train_result = train_lora(
+            peft_model, tokenizer, train_ds, val_ds, study_cfg.ft,
+            output_dir=ckpt_dir,
+            run_name=f"sfs_{dataset_name}_s{seed}",
+            layer_sequence=effective_seq, num_layers=num_layers,
+        )
 
-    del peft_model
-    torch.cuda.empty_cache()
+        del peft_model
+        torch.cuda.empty_cache()
 
-    # -- Phase 3: re-search on fine-tuned model --
+    # -- Phase 3: re-search on fine-tuned model, ANCHORED at pre_ft_seq --
+    # The FT adapter was trained with the model running ``pre_ft_seq`` order,
+    # so the only fair baseline for the post-FT MCTS is the FT model under
+    # the SAME pre_ft_seq order, not the identity sequence.
+    pre_ft_active = seq_to_layers(pre_ft_seq)
     ft_mcts = _MCTSModelFromLoaded.from_pretrained_ft(
-        model_name, train_result.adapter_dir, layer_sequence=None,
+        model_name, train_result.adapter_dir, layer_sequence=pre_ft_active,
         rank=study_cfg.gpu_rank,
     )
-    search2_prefix = os.path.join(arm_dir, f"search2_ft_{dataset_name}")
+    ft_mcts.wrapper.default_layer_indices = list(pre_ft_seq)
+    search2_prefix = os.path.join(arm_dir, f"search2_ft_{dataset_name}_seed{seed}")
     search_pool = _get_search_samples(splits, study_cfg)
     post_ft_seq, search2_summary = run_search_for_study(
         ft_mcts, search_pool, study_cfg.search,
         dataset_name, model_name, search2_prefix,
         notify_signal=study_cfg.notify_signal,
+        anchor_seq=pre_ft_seq,
+        val_select_samples=splits.get("val_select"),
+        eval_model_for_rerank=ft_mcts.wrapper.model,
+        eval_tokenizer_for_rerank=ft_mcts.wrapper.tokenizer,
+        extra_rerank_candidates=[list(pre_ft_seq)],
     )
     search2_wall = search2_summary.get("elapsed_seconds", 0)
 
-    # Evaluate
     post_active = seq_to_layers(post_ft_seq)
     ft_mcts.wrapper.model.model.layer_indices = post_active
 
@@ -871,10 +1165,12 @@ def _run_search_ft_search(
         ft_mcts.wrapper.model, ft_mcts.wrapper.tokenizer,
         post_ft_seq, splits["test"], dataset_name, model_name, num_layers,
     )
+    test_per_example = test_metrics.pop("per_example", [])
     val_metrics = evaluate_on_test(
         ft_mcts.wrapper.model, ft_mcts.wrapper.tokenizer,
         post_ft_seq, splits["val_select"], dataset_name, model_name, num_layers,
     )
+    val_select_per_example = val_metrics.pop("per_example", [])
 
     del ft_mcts
     torch.cuda.empty_cache()
@@ -899,6 +1195,8 @@ def _run_search_ft_search(
         "edit_distance_between": _edit_distance(pre_ft_seq, post_ft_seq),
         "sequences_identical": pre_ft_seq == post_ft_seq,
         "adapter_path": train_result.adapter_dir,
+        "test_per_example": test_per_example,
+        "val_select_per_example": val_select_per_example,
     }
     return result
 
@@ -1071,10 +1369,115 @@ def aggregate_results(all_results: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "identical": False,
             })
 
+    paired_cis = _compute_paired_cis(all_results)
+
     return {
         "arm_summary": arm_summary,
         "route_table": route_table,
+        "paired_cis": paired_cis,
     }
+
+
+def _compute_paired_cis(all_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Compute paired-bootstrap CIs comparing ft_only to each search arm.
+
+    Joins per-question outcomes by ``sample_hash`` for each (dataset, seed),
+    then also pools across seeds within each dataset. Returns a dict with
+    ``per_seed`` and ``pooled`` lists of comparisons.
+    """
+    try:
+        from dataclasses import asdict as _dc_asdict
+
+        from .paired_bootstrap import (
+            paired_bootstrap_diff,
+            pool_per_question_outcomes,
+        )
+    except Exception as e:  # pragma: no cover
+        logger.warning("paired_bootstrap module unavailable: %s", e)
+        return {}
+
+    by_key: Dict[Tuple[str, int, str], List[Dict[str, Any]]] = {}
+    for r in all_results:
+        if "error" in r:
+            continue
+        per = r.get("test_per_example") or []
+        if not per:
+            continue
+        key = (r.get("dataset", ""), int(r.get("seed", -1)), r.get("arm", ""))
+        by_key[key] = per
+
+    arms = sorted({k[2] for k in by_key})
+    datasets = sorted({k[0] for k in by_key})
+    seeds_by_ds: Dict[str, List[int]] = {}
+    for (ds, sd, _arm) in by_key:
+        seeds_by_ds.setdefault(ds, [])
+        if sd not in seeds_by_ds[ds]:
+            seeds_by_ds[ds].append(sd)
+
+    ft_only_arm = ArmType.FT_ONLY.value
+    out: Dict[str, Any] = {"per_seed": [], "pooled": []}
+
+    for ds in datasets:
+        for sd in seeds_by_ds.get(ds, []):
+            base = by_key.get((ds, sd, ft_only_arm))
+            if base is None:
+                continue
+            for arm in arms:
+                if arm == ft_only_arm:
+                    continue
+                other = by_key.get((ds, sd, arm))
+                if other is None:
+                    continue
+                try:
+                    res = paired_bootstrap_diff(base, other)
+                except Exception as e:
+                    logger.warning(
+                        "paired CI failed (%s seed=%d %s vs ft_only): %s",
+                        ds, sd, arm, e,
+                    )
+                    continue
+                if res is None:
+                    continue
+                out["per_seed"].append({
+                    "dataset": ds,
+                    "seed": sd,
+                    "arm_a": ft_only_arm,
+                    "arm_b": arm,
+                    **_dc_asdict(res),
+                })
+
+        for arm in arms:
+            if arm == ft_only_arm:
+                continue
+            base_per_seed: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+            other_per_seed: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+            for sd in seeds_by_ds.get(ds, []):
+                if (ds, sd, ft_only_arm) in by_key and (ds, sd, arm) in by_key:
+                    base_per_seed[(ft_only_arm, sd)] = by_key[(ds, sd, ft_only_arm)]
+                    other_per_seed[(arm, sd)] = by_key[(ds, sd, arm)]
+            if not base_per_seed or not other_per_seed:
+                continue
+            try:
+                pooled_a = pool_per_question_outcomes(base_per_seed).get(ft_only_arm, [])
+                pooled_b = pool_per_question_outcomes(other_per_seed).get(arm, [])
+                res = paired_bootstrap_diff(pooled_a, pooled_b)
+            except Exception as e:
+                logger.warning(
+                    "pooled paired CI failed (%s %s vs ft_only): %s",
+                    ds, arm, e,
+                )
+                continue
+            if res is None:
+                continue
+            out["pooled"].append({
+                "dataset": ds,
+                "arm_a": ft_only_arm,
+                "arm_b": arm,
+                "n_seeds": len(base_per_seed),
+                **_dc_asdict(res),
+            })
+
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1178,6 +1581,19 @@ def _print_summary(summary: Dict[str, Any]) -> None:
         if dists:
             print(f"  Edit distance: mean={np.mean(dists):.1f}, max={max(dists)}")
 
+    paired = summary.get("paired_cis") or {}
+    pooled = paired.get("pooled") or []
+    if pooled:
+        print("\n--- Paired bootstrap CIs (pooled across seeds, vs ft_only) ---")
+        for entry in sorted(pooled, key=lambda e: (e["dataset"], e["arm_b"])):
+            print(
+                f"  {entry['dataset']:<16} {entry['arm_b']:<18}"
+                f" diff={entry['mean_diff']:+.4f}"
+                f" 95% CI=[{entry['ci_lo']:+.4f}, {entry['ci_hi']:+.4f}]"
+                f" p={entry['p_two_sided']:.3f}"
+                f" (n={entry['n_paired']}, seeds={entry['n_seeds']})"
+            )
+
     print("=" * 80)
 
 
@@ -1195,7 +1611,7 @@ def main():
         "--datasets", type=str, nargs="+",
         default=["arc_easy", "arc_challenge", "mmlu", "commonsenseqa", "boolq", "winogrande"],
     )
-    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 1337, 2024])
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
     parser.add_argument(
         "--arms", type=str, nargs="+",
         default=[a.value for a in ArmType],
@@ -1230,22 +1646,47 @@ def main():
              "positions while keeping base weights shared.",
     )
     parser.add_argument(
-        "--share_train_for_search", action="store_true", default=False,
-        help="Use the train_ft split for MCTS search evaluation instead "
-             "of the dedicated val_search split.  Gives search 2-4x more "
-             "data and dramatically improves tier-promotion power.",
+        "--share_train_for_search",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the train_ft pool (== val_search) for MCTS search "
+             "evaluation. Default ON under the new split scheme. Pass "
+             "--no-share_train_for_search to revert to a dedicated "
+             "val_search split (legacy behavior).",
+    )
+    parser.add_argument(
+        "--mcts_4bit",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Load base MCTS in 4-bit (NF4). Default OFF: base MCTS now "
+             "runs in fp16 to match evaluation precision and avoid "
+             "spurious wins that don't transfer to the test path.",
     )
     parser.add_argument(
         "--search_tier2", type=int, default=None,
-        help="Override tier-2 sample count for MCTS (default: 100)",
+        help="Override tier-2 sample count for MCTS (default: 300)",
     )
     parser.add_argument(
         "--search_tier3", type=int, default=None,
-        help="Override tier-3 sample count for MCTS (default: 500)",
+        help="Override tier-3 sample count for MCTS (default: 1500)",
     )
     parser.add_argument(
         "--search_tier4", type=int, default=None,
-        help="Override tier-4 sample count for MCTS (default: 1000)",
+        help="Override tier-4 sample count for MCTS. Default -1 means "
+             "'use all remaining train_ft samples after tier2/tier3'.",
+    )
+    parser.add_argument(
+        "--rerank_topk", type=int, default=None,
+        help="Override post-MCTS top-K re-rank pool size on val_select "
+             "(default: 5).",
+    )
+    parser.add_argument(
+        "--promote_use_wilson",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Gate tier-2->tier-3 and tier-3->tier-4 promotions on the "
+             "Wilson lower bound exceeding the baseline accuracy. "
+             "Default ON (winner's-curse mitigation).",
     )
     parser.add_argument(
         "--preset_sequences_json", type=str, default=None,
@@ -1296,12 +1737,16 @@ def main():
     )
     study_cfg.search.num_simulations = args.num_simulations
     study_cfg.share_train_for_search = args.share_train_for_search
+    study_cfg.search.mcts_load_in_4bit = args.mcts_4bit
+    study_cfg.search.promote_use_wilson = args.promote_use_wilson
     if args.search_tier2 is not None:
         study_cfg.search.tier2_samples = args.search_tier2
     if args.search_tier3 is not None:
         study_cfg.search.tier3_samples = args.search_tier3
     if args.search_tier4 is not None:
         study_cfg.search.tier4_samples = args.search_tier4
+    if args.rerank_topk is not None:
+        study_cfg.search.rerank_topk = args.rerank_topk
     study_cfg.ft.freeze_repeated_lora = args.freeze_repeated_lora
     study_cfg.ft.scale_repeated_lr = args.scale_repeated_lr
     study_cfg.ft.clone_repeated_lora = args.clone_repeated_lora

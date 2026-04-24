@@ -247,6 +247,33 @@ def _load_data_compositional(args) -> Dict[str, Any]:
             "for at least one of --benchmarks."
         )
 
+    # Optional local-Möbius supervision files per benchmark. These are
+    # mandatory when SMAC samples a trial with ``use_local_*`` enabled
+    # (search_space_compositional exposes those knobs; without files the
+    # trial silently falls back to no local supervision — see
+    # ``compositional_objective.train_and_score_compositional``).
+    local_moebius_paths: Dict[str, Path] = {}
+    if getattr(args, "local_moebius_dir", None):
+        ldir = Path(args.local_moebius_dir)
+        if not ldir.is_dir():
+            raise SystemExit(f"--local_moebius_dir not a directory: {ldir}")
+        for bench in benchmarks:
+            cand = ldir / f"{bench}.pt"
+            if not cand.is_file():
+                alt = ldir / f"local_moebius_{bench}.pt"
+                if alt.is_file():
+                    cand = alt
+            if cand.is_file():
+                local_moebius_paths[bench] = cand
+            else:
+                logger.warning(
+                    "[%s] local Möbius target file missing in %s "
+                    "(expected {bench}.pt or local_moebius_{bench}.pt); "
+                    "SMAC trials sampling Möbius=on will disable it for "
+                    "this benchmark.",
+                    bench, ldir,
+                )
+
     # Probe d_model from a tiny dataset slice (one benchmark).
     probe_bench = benchmarks[0]
     probe_dataset = CompositionalDataset(artifacts, benchmarks=[probe_bench])
@@ -269,6 +296,7 @@ def _load_data_compositional(args) -> Dict[str, Any]:
         "artifacts": artifacts,
         "benchmarks": benchmarks,
         "dense_paths": dense_paths,
+        "local_moebius_paths": local_moebius_paths or None,
         "scope": args.scope,
         "d_model": d_model,
         "use_full_sequence": bool(args.use_full_sequence),
@@ -491,6 +519,13 @@ def parse_args():
     p.add_argument("--dense_deltas", type=str, nargs="+", default=None,
                    help="(compositional) bench=path entries with dense Δ matrices "
                         "(produced by data_prep.import_mined_dense_matrix or dr-llm).")
+    p.add_argument("--local_moebius_dir", type=str, default=None,
+                   help="(compositional) directory with local-Möbius target .pt "
+                        "files (produced by data_prep.build_local_moebius_targets). "
+                        "Required when the HPO search space turns on "
+                        "use_local_unary/use_local_pair; without it such trials "
+                        "silently disable local supervision and SMAC cannot "
+                        "identify whether Möbius helps or hurts.")
     p.add_argument("--objective_metric",
                    choices=["mean_uplift", "obs_top1_acc"], default="mean_uplift",
                    help="(compositional) which val metric SMAC maximises.")
@@ -538,8 +573,12 @@ def parse_args():
         "--resume",
         choices=["yes", "no"],
         default="no",
-        help="yes: continue SMAC from output_dir/smac3_output (surrogate + run history), "
-             "reload best proxy from best_routing_system_*/meta.json; no: fresh run (overwrite).",
+        help="yes: keep SMAC state under output_dir (overwrite=false); append to "
+             "threshold_prior_archive.jsonl; set trial index from archive size; load "
+             "best_routing_system_*/meta.json. Same n_trials/seed/budgets/configspace as "
+             "the saved run. no: new SMAC run (wipes smac3_output for this scenario). "
+             "W&B: starts a new run unless you set WANDB_RUN_ID+resume. Per-trial metrics "
+             "are flat ``hpo/*`` with step = trial index (continues from archive when resuming).",
     )
 
     return p.parse_args()

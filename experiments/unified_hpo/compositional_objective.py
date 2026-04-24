@@ -27,6 +27,7 @@ import torch
 
 from experiments.unified_hpo.search_space_compositional import (
     get_edit_hidden_dims,
+    get_local_moebius_cfg,
     get_pair_hidden_dims,
     get_pair_topk_primitives,
     get_unary_hidden_dims,
@@ -114,8 +115,10 @@ def train_and_score_compositional(
     use_full_sequence: bool = False,
     wandb_run: Any = None,
     wandb_prefix: str = "",
+    wandb_step_offset: int = 0,
     use_dense_supervision: Optional[bool] = None,
     downstream_eval_every: int = 0,
+    local_moebius_paths: Optional[Dict[str, Path]] = None,
 ) -> TrainResult:
     """Train a compositional router for one HPO trial; return a ``TrainResult``.
 
@@ -144,6 +147,43 @@ def train_and_score_compositional(
     pair_hidden_dims = get_pair_hidden_dims(config)
     pair_topk_primitives = get_pair_topk_primitives(config)
     use_pairs = bool(config.get("use_pairs", False))
+
+    # Resolve Möbius-supervision knobs from the SMAC config. Conditional
+    # params (``local_alpha``, ``local_pair_beta``) collapse to inert values
+    # when their gating bool is off, so a config without them behaves
+    # exactly like the pre-fix defaults.
+    moebius_cfg = get_local_moebius_cfg(config)
+    local_paths_for_trial: Optional[Dict[str, Path]] = None
+    if moebius_cfg["use_local_unary"] or moebius_cfg["use_local_pair"]:
+        if not local_moebius_paths:
+            logger.warning(
+                "SMAC trial requested Möbius supervision (use_local_unary=%s "
+                "use_local_pair=%s) but no --local_moebius_dir was provided; "
+                "disabling local supervision for this trial.",
+                moebius_cfg["use_local_unary"], moebius_cfg["use_local_pair"],
+            )
+            moebius_cfg["use_local_unary"] = False
+            moebius_cfg["use_local_pair"] = False
+            moebius_cfg["local_alpha"] = 0.0
+        else:
+            # Only pass benchmarks that actually have a matching file; if
+            # *no* benchmark in the current trial has one, fall back to
+            # disabling local supervision for the trial (instead of
+            # crashing) so SMAC sees a valid, comparable proxy.
+            local_paths_for_trial = {
+                b: p for b, p in local_moebius_paths.items() if b in benchmarks
+            }
+            if not local_paths_for_trial:
+                logger.warning(
+                    "SMAC trial requested Möbius supervision but none of the "
+                    "trial benchmarks %s have a matching local-moebius file; "
+                    "disabling local supervision for this trial.",
+                    list(benchmarks),
+                )
+                moebius_cfg["use_local_unary"] = False
+                moebius_cfg["use_local_pair"] = False
+                moebius_cfg["local_alpha"] = 0.0
+                local_paths_for_trial = None
 
     # Per-trial workdir — keep it isolated so concurrent trials don't clash.
     cleanup_tmp = output_dir is None
@@ -195,6 +235,7 @@ def train_and_score_compositional(
         use_full_sequence=bool(use_full_sequence),
         wandb_run=wandb_run,
         wandb_prefix=wandb_prefix,
+        wandb_step_offset=int(wandb_step_offset),
         use_pairs=use_pairs,
         pair_hidden_dims=pair_hidden_dims if use_pairs else (96, 96),
         pair_dropout=float(config.get("pair_dropout", 0.1)),
@@ -206,11 +247,11 @@ def train_and_score_compositional(
         downstream_eval_every=int(downstream_eval_every),
         observed_path_overrides=None,
         dense_keep_mask_paths=None,
-        local_moebius_paths=None,
-        use_local_unary=False,
-        use_local_pair=False,
-        local_alpha=0.0,
-        local_pair_beta=1.0,
+        local_moebius_paths=local_paths_for_trial,
+        use_local_unary=bool(moebius_cfg["use_local_unary"]),
+        use_local_pair=bool(moebius_cfg["use_local_pair"]),
+        local_alpha=float(moebius_cfg["local_alpha"]),
+        local_pair_beta=float(moebius_cfg["local_pair_beta"]),
     )
 
     if payload is None:

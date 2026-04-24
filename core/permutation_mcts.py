@@ -965,10 +965,24 @@ def worker_evaluate(
     model = MCTSModel(config.model_name, rank=rank)
     mcts = MCTS(model, config)
     
+    # Per-sample outcome categories (exclusive, exhaustive):
+    #   recovered         : orig=0 → mcts=1     (genuine improvement)
+    #   regressed         : orig=1 → mcts=0     (MCTS broke a correct sample)
+    #   maintained_correct: orig=1 → mcts=1     (no regression)
+    #   still_wrong       : orig=0 → mcts=0     (MCTS couldn't fix it)
+    # The previous "improved_cases" (stored as bool ``new > orig``) is the
+    # ``recovered`` column alone; it is kept in the return payload for
+    # backward compatibility of any downstream consumer, but the
+    # aggregation now also emits the three other cells and a single
+    # ``net_improvement = recovered − regressed`` rate.
     local_results = {
         "original_correct": [],
         "mcts_correct": [],
-        "improved_cases": [],
+        "improved_cases": [],           # kept for back-compat (== recovered per-sample)
+        "recovered": [],                # 0→1
+        "regressed": [],                # 1→0
+        "maintained_correct": [],       # 1→1
+        "still_wrong": [],              # 0→0
         "visited_samples": 0,
         "num_swaps": [],
         "best_permutation": [],
@@ -1004,10 +1018,15 @@ def worker_evaluate(
         # Get best permutation (fewest swaps among successful ones)
         best_perm = min(good_perms, key=lambda p: p.num_swaps) if good_perms else model.default_permutation
         
-        # Record this sample (no biased replacement - fair evaluation)
-        local_results["original_correct"].append(int(original_correct > 0.5))
-        local_results["mcts_correct"].append(int(is_correct))
-        local_results["improved_cases"].append(float(is_correct) > original_correct)
+        orig_bit = int(original_correct > 0.5)
+        new_bit = int(bool(is_correct))
+        local_results["original_correct"].append(orig_bit)
+        local_results["mcts_correct"].append(new_bit)
+        local_results["improved_cases"].append(bool(new_bit > orig_bit))
+        local_results["recovered"].append(int(orig_bit == 0 and new_bit == 1))
+        local_results["regressed"].append(int(orig_bit == 1 and new_bit == 0))
+        local_results["maintained_correct"].append(int(orig_bit == 1 and new_bit == 1))
+        local_results["still_wrong"].append(int(orig_bit == 0 and new_bit == 0))
         local_results["num_swaps"].append(best_perm.num_swaps)
         local_results["best_permutation"].append(best_perm.layers)
         local_results["good_permutations"].append([p.layers for p in good_perms])
@@ -1015,7 +1034,7 @@ def worker_evaluate(
         local_results["search_histories"].append(search_history)
         
         # Stop when we have enough samples
-        if len(local_results["improved_cases"]) >= required_samples:
+        if len(local_results["recovered"]) >= required_samples:
             break
     
     return local_results
@@ -1074,7 +1093,14 @@ def evaluate_mcts(args) -> Dict:
         "exp": args.exp,
         "original_accuracy": 0.0,
         "mcts_accuracy": 0.0,
-        "improved_cases_accuracy": 0.0,
+        # --- New, unambiguous metrics (ratios of num_samples) ---
+        "recovery_rate": 0.0,            # P(orig=0 ∧ new=1) — "genuine recoveries"
+        "regression_rate": 0.0,          # P(orig=1 ∧ new=0) — "MCTS broke it"
+        "maintained_correct_rate": 0.0,  # P(orig=1 ∧ new=1) — "no regression"
+        "still_wrong_rate": 0.0,         # P(orig=0 ∧ new=0) — "MCTS couldn't fix"
+        "net_improvement": 0.0,          # recovery_rate − regression_rate
+        # --- Kept for backward compatibility with existing dashboards ---
+        "improved_cases_accuracy": 0.0,  # == recovery_rate * 100
         "average_num_swaps": 0.0,
         "config": {
             "num_simulations": config.num_simulations,
@@ -1093,7 +1119,11 @@ def evaluate_mcts(args) -> Dict:
         "visited_samples": 0,
         "original_correct": [],
         "mcts_correct": [],
-        "improved_cases": [],
+        "improved_cases": [],            # per-sample bool (back-compat)
+        "recovered": [],                 # per-sample int 0/1
+        "regressed": [],                 # per-sample int 0/1
+        "maintained_correct": [],        # per-sample int 0/1
+        "still_wrong": [],               # per-sample int 0/1
         "num_swaps": [],
         "best_permutation": [],
         "good_permutations": [],
@@ -1105,6 +1135,10 @@ def evaluate_mcts(args) -> Dict:
         results["original_correct"].extend(partial["original_correct"])
         results["mcts_correct"].extend(partial["mcts_correct"])
         results["improved_cases"].extend(partial["improved_cases"])
+        results["recovered"].extend(partial.get("recovered", []))
+        results["regressed"].extend(partial.get("regressed", []))
+        results["maintained_correct"].extend(partial.get("maintained_correct", []))
+        results["still_wrong"].extend(partial.get("still_wrong", []))
         results["num_swaps"].extend(partial["num_swaps"])
         results["best_permutation"].extend(partial["best_permutation"])
         results["good_permutations"].extend(partial["good_permutations"])
@@ -1121,7 +1155,20 @@ def evaluate_mcts(args) -> Dict:
     if num_samples > 0:
         results["original_accuracy"] = sum(results["original_correct"]) / num_samples * 100
         results["mcts_accuracy"] = sum(results["mcts_correct"]) / num_samples * 100
-        results["improved_cases_accuracy"] = sum(results["improved_cases"]) / num_samples * 100
+        recovered_n = sum(results["recovered"])
+        regressed_n = sum(results["regressed"])
+        maintained_n = sum(results["maintained_correct"])
+        still_wrong_n = sum(results["still_wrong"])
+        results["recovery_rate"] = recovered_n / num_samples
+        results["regression_rate"] = regressed_n / num_samples
+        results["maintained_correct_rate"] = maintained_n / num_samples
+        results["still_wrong_rate"] = still_wrong_n / num_samples
+        results["net_improvement"] = (
+            results["recovery_rate"] - results["regression_rate"]
+        )
+        # Preserve prior dashboard key; semantically identical to
+        # recovery_rate * 100. Kept around so old summaries don't break.
+        results["improved_cases_accuracy"] = results["recovery_rate"] * 100.0
         results["average_num_swaps"] = np.mean(results["num_swaps"])
     
     # Add runtime and additional stats to results
@@ -1140,7 +1187,18 @@ def evaluate_mcts(args) -> Dict:
     print("-" * 60)
     print(f"Original model accuracy: {results['original_accuracy']:.1f}%")
     print(f"MCTS best permutation accuracy: {results['mcts_accuracy']:.1f}%")
-    print(f"Improved cases: {results['improved_cases_accuracy']:.1f}%")
+    print(
+        "Outcome breakdown: recovered (0→1)={rec:.1%}  "
+        "regressed (1→0)={reg:.1%}  "
+        "maintained (1→1)={mai:.1%}  "
+        "still_wrong (0→0)={stl:.1%}".format(
+            rec=results["recovery_rate"],
+            reg=results["regression_rate"],
+            mai=results["maintained_correct_rate"],
+            stl=results["still_wrong_rate"],
+        )
+    )
+    print(f"Net improvement (recovered − regressed): {results['net_improvement']:+.1%}")
     print(f"Average number of swaps: {results['average_num_swaps']:.2f}")
     print("-" * 60)
     print(f"Neighborhood radius: {config.neighborhood_radius}")

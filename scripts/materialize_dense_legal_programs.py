@@ -71,6 +71,9 @@ def main() -> int:
     payload = torch.load(args.unified_matrix, map_location="cpu", weights_only=False)
     delta = payload["delta_matrix"].float()
     anchor_u = payload["anchor_utilities"].float()
+    delta_bin = payload.get("delta_matrix_binary")
+    if delta_bin is not None:
+        delta_bin = delta_bin.float()
     Q, R_uni = delta.shape
     if R_uni != len(uni_routes):
         raise SystemExit(
@@ -101,6 +104,11 @@ def main() -> int:
         "n_legal_programs": n_legal,
         "n_unique_routes": R_uni,
     }
+    if delta_bin is not None:
+        expanded_bin = delta_bin.index_select(1, cols).contiguous()
+        out_payload["delta_matrix_binary"] = expanded_bin
+    if "anchor_accuracies" in payload:
+        out_payload["anchor_accuracies"] = payload["anchor_accuracies"]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(out_payload, args.output)
     print(

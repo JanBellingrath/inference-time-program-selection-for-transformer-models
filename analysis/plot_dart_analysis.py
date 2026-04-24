@@ -149,8 +149,9 @@ def load_stats(path: str) -> Dict:
 def load_fine_routing_mcts_jsonl(jsonl_path: str) -> pd.DataFrame:
     """Load fine-grained MCTS supervision JSONL into a DART-compatible frame.
 
-    Expects records from ``build_ft_fine_routing_dataset`` / similar pipelines with
-    ``anchor_score``, ``best_score``, ``scoring_mode`` (``binary`` or ``continuous``).
+    Expects records from ``build_fine_routing_dataset`` / similar pipelines with
+    ``anchor_score``, ``best_score``, ``scoring_mode`` (``binary``, ``continuous``,
+    or ``both``; when ``both`` we use ``anchor_score_binary`` / ``best_score_binary`` if present).
 
     Columns produced:
       * ``original_correct`` — baseline (anchor routing) treated as correct
@@ -163,10 +164,14 @@ def load_fine_routing_mcts_jsonl(jsonl_path: str) -> pd.DataFrame:
             if not line.strip():
                 continue
             d = json.loads(line)
-            a = float(d.get("anchor_score", 0.0))
-            b = float(d.get("best_score", 0.0))
             mode = (d.get("scoring_mode") or "binary").lower()
-            if mode == "binary":
+            if mode == "both" and d.get("anchor_score_binary") is not None:
+                a = float(d.get("anchor_score_binary", 0.0))
+                b = float(d.get("best_score_binary", d.get("best_score", 0.0)))
+            else:
+                a = float(d.get("anchor_score", 0.0))
+                b = float(d.get("best_score", 0.0))
+            if mode in ("binary", "both"):
                 oc = a >= 0.5
                 improved = (not oc) and (b >= 0.5)
             else:

@@ -8,10 +8,10 @@ Inputs
   produced by ``dr-llm/data_prep/dense_reevaluation.py``::
 
       old_dense_dir/
-        dense_deltas_matrix.pt   # {'delta_matrix [Q,R_old]', 'anchor_utilities [Q]',
-                                 #   'routes [R_old]', 'benchmarks', 'score_mode'}
-        dense_deltas.jsonl       # one row per question; route_utilities/route_deltas
-                                 #   keyed by stringified column index in 'routes'
+        dense_deltas_matrix.pt   # {'delta_matrix', 'anchor_utilities', 'routes', ...};
+                                 #   optional 'delta_matrix_binary', 'anchor_accuracies'
+        dense_deltas.jsonl       # per question: route_utilities, route_deltas;
+                                 #   optional route_deltas_binary, anchor_accuracy
 
 * ``--new_dense_dir``: directory containing the assign-increment dense outputs
   produced by re-running ``dense_reevaluation.py`` against the
@@ -152,15 +152,27 @@ def merge_matrices(
     unified_routes: Sequence[RouteKey],
     anchor_atol: float = 1e-4,
     allow_missing_routes: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, Any]], Dict[str, Any]]:
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    List[Dict[str, Any]],
+    Dict[str, Any],
+]:
     """Concatenate old + new dense matrices and reorder columns to
     ``unified_routes``.
 
+    When both payloads include ``delta_matrix_binary`` / ``anchor_accuracies``,
+    those are merged with the same column routing as ``delta_matrix``.
+
     Returns
     -------
-    delta_matrix : ``[Q, R_unified]`` float tensor.
+    delta_matrix : ``[Q, R_unified]`` float tensor (continuous Δ).
     anchor_utilities : ``[Q]`` float tensor (taken from old payload, validated
         against new where overlapping).
+    delta_matrix_binary : ``[Q, R_unified]`` or ``None`` if legacy inputs.
+    anchor_accuracies : ``[Q]`` or ``None`` if legacy inputs.
     column_provenance : list of length ``R_unified``, each entry::
             {"route": [...], "source": "old"|"new"|"both",
              "old_col": int|None, "new_col": int|None}
@@ -172,6 +184,14 @@ def merge_matrices(
         raise ValueError(
             f"score_mode mismatch: old={old_score!r} new={new_score!r}; "
             "merge would mix incompatible supervision."
+        )
+    has_bin_old = "delta_matrix_binary" in old_payload
+    has_bin_new = "delta_matrix_binary" in new_payload
+    if has_bin_old != has_bin_new:
+        raise ValueError(
+            f"binary sidecar mismatch: old has delta_matrix_binary={has_bin_old}, "
+            f"new has {has_bin_new}. Re-run dense_reevaluation with dual scoring "
+            "on both, or use two legacy dirs without binary."
         )
     old_benches = list(old_payload.get("benchmarks", []))
     new_benches = list(new_payload.get("benchmarks", []))
@@ -206,6 +226,18 @@ def merge_matrices(
 
     R_uni = len(unified_routes)
     delta_uni = torch.zeros((Q, R_uni), dtype=torch.float32)
+    delta_uni_bin: Optional[torch.Tensor] = None
+    if has_bin_old:
+        delta_uni_bin = torch.zeros((Q, R_uni), dtype=torch.float32)
+        old_dmb: torch.Tensor = old_payload["delta_matrix_binary"].float()
+        new_dmb: torch.Tensor = new_payload["delta_matrix_binary"].float()
+        old_aa: torch.Tensor = old_payload["anchor_accuracies"].float()
+        new_aa: torch.Tensor = new_payload["anchor_accuracies"].float()
+        aa_diff = (old_aa[:Q] - new_aa[:Q]).abs().max().item()
+        if aa_diff > anchor_atol:
+            raise ValueError(
+                f"anchor_accuracies disagree by {aa_diff:.4g} > atol {anchor_atol}."
+            )
     column_provenance: List[Dict[str, Any]] = []
     n_from_old = n_from_new = n_both = 0
     missing: List[int] = []
@@ -227,14 +259,20 @@ def merge_matrices(
                     diff, old_col, new_col,
                 )
             delta_uni[:, c] = v_old
+            if delta_uni_bin is not None:
+                delta_uni_bin[:, c] = old_dmb[:Q, old_col]
             n_both += 1
             src = "both"
         elif in_old:
             delta_uni[:, c] = old_dm[:Q, old_col]
+            if delta_uni_bin is not None:
+                delta_uni_bin[:, c] = old_dmb[:Q, old_col]
             n_from_old += 1
             src = "old"
         elif in_new:
             delta_uni[:, c] = new_dm[:Q, new_col]
+            if delta_uni_bin is not None:
+                delta_uni_bin[:, c] = new_dmb[:Q, new_col]
             n_from_new += 1
             src = "new"
         else:
@@ -266,8 +304,12 @@ def merge_matrices(
         "columns_missing": int(len(missing)),
         "score_mode": old_score,
         "benchmarks": old_benches,
+        "has_binary_sidecar": bool(delta_uni_bin is not None),
     }
-    return delta_uni, old_au[:Q].contiguous(), column_provenance, stats
+    anchor_acc_out: Optional[torch.Tensor] = None
+    if has_bin_old:
+        anchor_acc_out = old_aa[:Q].contiguous()
+    return delta_uni, old_au[:Q].contiguous(), delta_uni_bin, anchor_acc_out, column_provenance, stats
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +353,7 @@ def merge_jsonl(
         base = dict(old_rec or new_rec)  # carry common fields like benchmark_id, score_mode, mcts_source
         ru: Dict[str, float] = {}
         rd: Dict[str, float] = {}
+        rdb: Dict[str, float] = {}
         if old_rec is not None:
             for k, v in (old_rec.get("route_utilities") or {}).items():
                 c = old_to_uni.get(int(k))
@@ -320,6 +363,10 @@ def merge_jsonl(
                 c = old_to_uni.get(int(k))
                 if c is not None:
                     rd[str(c)] = float(v)
+            for k, v in (old_rec.get("route_deltas_binary") or {}).items():
+                c = old_to_uni.get(int(k))
+                if c is not None:
+                    rdb[str(c)] = float(v)
         if new_rec is not None:
             for k, v in (new_rec.get("route_utilities") or {}).items():
                 c = new_to_uni.get(int(k))
@@ -329,11 +376,21 @@ def merge_jsonl(
                 c = new_to_uni.get(int(k))
                 if c is not None:
                     rd[str(c)] = float(v)
+            for k, v in (new_rec.get("route_deltas_binary") or {}).items():
+                c = new_to_uni.get(int(k))
+                if c is not None:
+                    rdb[str(c)] = float(v)
         base["route_utilities"] = ru
         base["route_deltas"] = rd
+        if rdb:
+            base["route_deltas_binary"] = rdb
+        elif "route_deltas_binary" in base:
+            del base["route_deltas_binary"]
         # Prefer old anchor_utility when present, else new
         if old_rec is not None:
             base["anchor_utility"] = old_rec.get("anchor_utility")
+            if "anchor_accuracy" in old_rec:
+                base["anchor_accuracy"] = old_rec["anchor_accuracy"]
         out.append(base)
     return out
 
@@ -377,7 +434,14 @@ def run_merge(
         new_payload["delta_matrix"].shape[1], len(unified_routes),
     )
 
-    delta_uni, anchor_uni, column_provenance, mat_stats = merge_matrices(
+    (
+        delta_uni,
+        anchor_uni,
+        delta_uni_bin,
+        anchor_acc_uni,
+        column_provenance,
+        mat_stats,
+    ) = merge_matrices(
         old_payload=old_payload,
         new_payload=new_payload,
         unified_routes=unified_routes,
@@ -392,7 +456,7 @@ def run_merge(
         Q=Q,
     )
 
-    unified_payload = {
+    unified_payload: Dict[str, Any] = {
         "delta_matrix": delta_uni,
         "anchor_utilities": anchor_uni,
         "routes": [list(r) for r in unified_routes],
@@ -405,6 +469,9 @@ def run_merge(
             "bench": bench,
         },
     }
+    if delta_uni_bin is not None and anchor_acc_uni is not None:
+        unified_payload["delta_matrix_binary"] = delta_uni_bin
+        unified_payload["anchor_accuracies"] = anchor_acc_uni
     out_pt = output_dir / "dense_deltas_matrix.pt"
     torch.save(unified_payload, out_pt)
 

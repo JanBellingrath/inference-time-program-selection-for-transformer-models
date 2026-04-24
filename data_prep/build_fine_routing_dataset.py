@@ -5,8 +5,9 @@ For each benchmark *b*:
   1.  Load anchor sequence ``s_b`` from existing MCTS snapshots.
   2.  Load questions via ``prepare_arc_data``.
   3.  Enumerate all valid local deviations (1–2 edits in late layers).
-  4.  Per question: evaluate anchor + every deviation using TALE grading,
-      extract pivot residual, compute gate labels and router targets.
+  4.  Per question: evaluate anchor + every deviation; store **binary** (TALE)
+      and **continuous** (log-prob when applicable) scores, extract pivot
+      residual, compute gate labels and router targets.
   5.  Save ``{output_dir}/{benchmark}.pt`` and ``{benchmark}.jsonl``.
 
 Usage
@@ -183,6 +184,30 @@ def grade_sample_continuous(
     return grade_sample(wrapper, layers, sample, dataset, model_name, is_math)
 
 
+def grade_sample_both(
+    wrapper: FlexibleModelWrapper,
+    layers: List[int],
+    sample: Dict,
+    dataset: str,
+    model_name: str,
+    is_math: bool = False,
+) -> Tuple[float, float]:
+    """Binary TALE score and continuous (log-prob) score for the same forward route.
+
+    For ``max_new_tokens != 1``, :func:`grade_sample_continuous` falls back to
+    binary, so this returns ``(b, b)`` after a single :func:`grade_sample` call.
+    For single-token multiple-choice, runs generation (TALE) and a log-softmax
+    forward to obtain both.
+    """
+    ntok = int(sample.get("max_new_tokens", 1))
+    if ntok != 1:
+        b = grade_sample(wrapper, layers, sample, dataset, model_name, is_math)
+        return b, b
+    b = grade_sample(wrapper, layers, sample, dataset, model_name, is_math)
+    c = grade_sample_continuous(wrapper, layers, sample, dataset, model_name, is_math)
+    return b, c
+
+
 # ---------------------------------------------------------------------------
 # Router target distribution
 # ---------------------------------------------------------------------------
@@ -255,10 +280,12 @@ def build_dataset_for_benchmark(
 
     with open(jsonl_path, "w") as jsonl_file:
         for q_idx, sample in enumerate(tqdm(samples, desc=f"  {benchmark}")):
-            # --- anchor score ---
-            anchor_score = grade_sample(
+            # --- anchor: binary (TALE) + continuous (log-prob when applicable) ---
+            anchor_b, anchor_c = grade_sample_both(
                 wrapper, anchor_layers, sample, benchmark, cfg.model_name, is_math
             )
+            # Gate / router (exhaustive): primary = binary, unchanged for downstream.
+            anchor_score = anchor_b
 
             # --- pivot residual (under anchor layer order) ---
             pivot_res = wrapper.get_pivot_residual(
@@ -270,29 +297,38 @@ def build_dataset_for_benchmark(
             pivot_residuals.append(pivot_res.cpu().squeeze(0))  # [d_model]
 
             # --- evaluate every deviation ---
-            scores: List[float] = []
-            deltas: List[float] = []
+            scores_b: List[float] = []
+            scores_c: List[float] = []
+            deltas_b: List[float] = []
+            deltas_c: List[float] = []
             for dev_idx, deviation in enumerate(deviations):
                 if not deviation:  # no-op
-                    scores.append(anchor_score)
-                    deltas.append(0.0)
+                    scores_b.append(anchor_b)
+                    scores_c.append(anchor_c)
+                    deltas_b.append(0.0)
+                    deltas_c.append(0.0)
                     continue
                 cand_seq = apply_deviation(anchor_seq, deviation)
                 cand_layers = seq_to_layers(cand_seq)
-                sc = grade_sample(
+                sc_b, sc_c = grade_sample_both(
                     wrapper, cand_layers, sample, benchmark, cfg.model_name, is_math
                 )
-                scores.append(sc)
-                deltas.append(sc - anchor_score)
+                scores_b.append(sc_b)
+                scores_c.append(sc_c)
+                deltas_b.append(sc_b - anchor_b)
+                deltas_c.append(sc_c - anchor_c)
 
-            # --- gate label ---
-            non_noop_deltas = [d for k, d in zip(dev_keys, deltas) if k != NOOP_KEY]
+            # --- gate label (binary deltas) ---
+            non_noop_deltas = [d for k, d in zip(dev_keys, deltas_b) if k != NOOP_KEY]
             best_delta = max(non_noop_deltas) if non_noop_deltas else 0.0
             gate_label = int(best_delta > cfg.gate_tau)
 
-            # --- router target ---
+            # --- router target (primary = binary) + continuous auxiliary ---
             router_target = compute_router_target(
-                deltas, beta=cfg.target_beta, clip_val=cfg.delta_clip
+                deltas_b, beta=cfg.target_beta, clip_val=cfg.delta_clip
+            )
+            router_target_continuous = compute_router_target(
+                deltas_c, beta=cfg.continuous_target_beta, clip_val=cfg.continuous_delta_clip
             )
 
             rec = {
@@ -301,17 +337,27 @@ def build_dataset_for_benchmark(
                 "question_hash": _sample_hash(sample),
                 "anchor_sequence": anchor_seq,
                 "anchor_score": anchor_score,
+                "anchor_score_binary": anchor_b,
+                "anchor_score_continuous": anchor_c,
+                "scoring_mode": "both",
+                "primary_scoring": "binary",
                 "pivot_layer_index": cfg.pivot_layer,
                 "deviations": [
                     {
                         "key": dev_keys[i],
-                        "score": scores[i],
-                        "delta": deltas[i],
+                        "score": scores_b[i],
+                        "delta": deltas_b[i],
+                        "score_binary": scores_b[i],
+                        "delta_binary": deltas_b[i],
+                        "score_continuous": scores_c[i],
+                        "delta_continuous": deltas_c[i],
                     }
                     for i in range(len(deviations))
                 ],
                 "gate_label": gate_label,
                 "router_target": router_target,
+                "router_target_binary": router_target,
+                "router_target_continuous": router_target_continuous,
             }
             records.append(rec)
             jsonl_file.write(json.dumps(rec) + "\n")
@@ -353,9 +399,12 @@ def build_dataset_mcts_for_benchmark(
     pivot residuals, gate labels, and per-explored-sequence scores.  The
     ``router_target`` is a softmax over all MCTS-explored sequences.
 
-    When ``cfg.use_continuous_scoring`` is True, scores are log-probabilities
-    of the correct answer (continuous) rather than binary 0/1, producing
-    much richer supervision signal for the router.
+    ``cfg.use_continuous_scoring`` selects the **primary** signal used inside
+    MCTS (UCB) and for top-level ``anchor_score`` / ``score`` / ``delta`` /
+    ``router_target`` / ``gate_label``.  Binary (TALE) and continuous
+    (log-prob) scores are **always** recorded on each row in explicit fields
+    (``anchor_score_binary``, ``anchor_score_continuous``, and per explored
+    route the ``score_*`` / ``delta_*`` pair).
 
     When ``cfg.mcts_dual_seed`` is True, per-question MCTS is run twice
     with different random seeds and ``gate_label`` is set to 1 only when
@@ -524,6 +573,14 @@ def build_dataset_mcts_for_benchmark(
             anchor_score = mcts_result["anchor_score"]
             best_delta = mcts_result["best_delta"]
 
+            def _both_for_seq(seq: List[int]) -> Tuple[float, float]:
+                layers = seq_to_layers(seq)
+                if not layers:
+                    return 0.0, -30.0
+                return grade_sample_both(
+                    wrapper, layers, sample, benchmark, cfg.model_name, is_math
+                )
+
             # --- optional dual-seed stabilisation ---
             dual_gate_agree = True
             if dual_seed:
@@ -550,6 +607,11 @@ def build_dataset_mcts_for_benchmark(
 
             gate_label = int(best_delta > gate_tau and dual_gate_agree)
 
+            anchor_b, anchor_c = _both_for_seq(anchor_seq)
+            best_b, best_c = _both_for_seq(mcts_result["best_seq"])
+            best_delta_b = best_b - anchor_b
+            best_delta_c = best_c - anchor_c
+
             explored = mcts_result["explored"]
             seq_keys = list(explored.keys())
             deltas = [explored[k] - anchor_score for k in seq_keys]
@@ -557,10 +619,33 @@ def build_dataset_mcts_for_benchmark(
                 deltas, beta=target_beta, clip_val=delta_clip,
             )
 
-            explored_list = [
-                {"seq": list(k), "score": explored[k], "delta": explored[k] - anchor_score}
-                for k in seq_keys
-            ]
+            deltas_b: List[float] = []
+            deltas_c: List[float] = []
+            explored_list: List[Dict] = []
+            for k in seq_keys:
+                b, c = _both_for_seq(list(k))
+                d_b = b - anchor_b
+                d_c = c - anchor_c
+                deltas_b.append(d_b)
+                deltas_c.append(d_c)
+                explored_list.append(
+                    {
+                        "seq": list(k),
+                        "score": explored[k],
+                        "delta": explored[k] - anchor_score,
+                        "score_binary": b,
+                        "delta_binary": d_b,
+                        "score_continuous": c,
+                        "delta_continuous": d_c,
+                    }
+                )
+
+            router_target_binary = compute_router_target(
+                deltas_b, beta=cfg.target_beta, clip_val=cfg.delta_clip
+            )
+            router_target_continuous = compute_router_target(
+                deltas_c, beta=cfg.continuous_target_beta, clip_val=cfg.continuous_delta_clip
+            )
 
             rec = {
                 "benchmark_id": benchmark,
@@ -568,16 +653,25 @@ def build_dataset_mcts_for_benchmark(
                 "question_hash": _sample_hash(sample),
                 "anchor_sequence": anchor_seq,
                 "anchor_score": anchor_score,
+                "anchor_score_binary": anchor_b,
+                "anchor_score_continuous": anchor_c,
                 "pivot_layer_index": cfg.pivot_layer,
                 "search_mode": "mcts",
-                "scoring_mode": "continuous" if continuous else "binary",
+                "scoring_mode": "both",
+                "primary_scoring": "continuous" if continuous else "binary",
                 "gate_label": gate_label,
                 "best_seq": mcts_result["best_seq"],
                 "best_score": mcts_result["best_score"],
+                "best_score_binary": best_b,
+                "best_score_continuous": best_c,
                 "best_delta": best_delta,
+                "best_delta_binary": best_delta_b,
+                "best_delta_continuous": best_delta_c,
                 "num_explored": mcts_result["num_explored"],
                 "explored": explored_list,
                 "router_target": router_target,
+                "router_target_binary": router_target_binary,
+                "router_target_continuous": router_target_continuous,
             }
             records.append(rec)
             jsonl_file.write(json.dumps(rec) + "\n")
@@ -635,7 +729,11 @@ def parse_args() -> FineRoutingConfig:
     p.add_argument(
         "--use_continuous_scoring",
         action="store_true",
-        help="Score with log-prob of correct answer instead of binary 0/1",
+        help=(
+            "MCTS+router primary = log-prob of correct label (log-softmax) instead "
+            "of TALE 0/1. Binary and continuous scores are always written to jsonl; "
+            "this only selects UCB/primary field semantics."
+        ),
     )
     p.add_argument(
         "--mcts_dual_seed",

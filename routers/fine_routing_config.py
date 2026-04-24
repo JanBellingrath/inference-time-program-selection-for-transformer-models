@@ -59,6 +59,8 @@ class FineRoutingConfig:
     delta_clip: float = 1.0
     target_beta: float = 5.0
     gate_tau: float = 0.0
+    # When building fine-routing jsonl, binary + continuous are both stored; this
+    # toggles the *primary* signal (MCTS UCB, top-level score/delta/router_target):
     use_continuous_scoring: bool = False
     continuous_delta_clip: float = 5.0
     continuous_target_beta: float = 2.0

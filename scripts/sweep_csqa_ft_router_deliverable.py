@@ -169,12 +169,21 @@ def main() -> int:
         flush=True,
     )
 
-    # NOTE: all four trials use the new efficient pair scorer; trial 1 & 3
-    # have pairs off which further isolates overfit sources.
+    # v1 + first v2 launch both failed because τ was far too soft for the
+    # actual Δ distribution: at τ=1.0 the softmax target across 1597 legal
+    # programs places only **0.4%** of its mass on the true top-1 program
+    # (and only 1.4% at τ=0.5), which means the CE loss is dominated by the
+    # bulk of near-tied middle-Δ programs rather than by the real signal at
+    # the top. Oracle mean-uplift is +0.99 per question and best-fixed-
+    # route averages +0.09 on val — so the signal is there, the supervisor
+    # just has to surface it. We therefore sweep τ ∈ {0.2, 0.3, 0.4}
+    # paired with student_temperature < 1 (sharper student logits), and
+    # bump λ so that shorter high-Δ routes are preferred over long
+    # multi-edit programs (length penalty).
     trials: list[tuple[str, list[str]]] = [
         (
-            # Strong unary-only baseline. Small, heavily regularised.
-            "t1_unary_small",
+            # Sharp τ + unary-only, modest capacity.
+            "t1_unary_sharp_tau",
             [
                 "--d_latent", "192",
                 "--edit_hidden_dims", "192", "192",
@@ -182,78 +191,82 @@ def main() -> int:
                 "--encoder_dropout", "0.25",
                 "--edit_dropout", "0.25",
                 "--unary_dropout", "0.25",
-                "--weight_decay", "0.08",
-                "--lr", "4e-4",
-                "--tau", "1.2",
-                "--student_temperature", "1.0",
-                "--lam", "0.001",
+                "--weight_decay", "0.06",
+                "--lr", "5e-4",
+                "--tau", "0.30",
+                "--student_temperature", "0.60",
+                "--lam", "0.005",
                 "--use_anchor_bias",
                 "--seed", "42",
             ],
         ),
         (
-            # Pairs on, aggressive regularisation on the pair head.
-            "t2_pairs_small_regularised",
+            # Pairs on, sharp τ, pair head regularised.
+            "t2_pairs_sharp_tau",
             [
                 "--d_latent", "224",
                 "--edit_hidden_dims", "224", "224",
                 "--unary_hidden_dims", "224", "224",
                 "--use_pairs",
                 "--pair_hidden_dims", "160", "160",
-                "--pair_dropout", "0.35",
-                "--pair_l2", "5e-4",
+                "--pair_dropout", "0.30",
+                "--pair_l2", "2e-4",
                 "--pair_topk_primitives", "12",
-                "--encoder_dropout", "0.30",
-                "--edit_dropout", "0.30",
-                "--unary_dropout", "0.30",
-                "--weight_decay", "0.10",
-                "--lr", "3e-4",
-                "--tau", "1.0",
-                "--student_temperature", "1.0",
-                "--lam", "0.0015",
+                "--encoder_dropout", "0.25",
+                "--edit_dropout", "0.25",
+                "--unary_dropout", "0.25",
+                "--weight_decay", "0.08",
+                "--lr", "4e-4",
+                "--tau", "0.30",
+                "--student_temperature", "0.60",
+                "--lam", "0.005",
                 "--use_anchor_bias",
                 "--seed", "43",
             ],
         ),
         (
-            # Unary-only but wider, with very heavy dropout + WD.
-            "t3_unary_wider_highreg",
+            # Very sharp τ + higher λ — strongest concentration on top-Δ
+            # short programs. Larger capacity to show whether τ=0.2 alone
+            # is enough to unlock learning.
+            "t3_unary_very_sharp_hi_lam",
             [
-                "--d_latent", "288",
-                "--edit_hidden_dims", "288", "288",
-                "--unary_hidden_dims", "288", "288",
-                "--encoder_dropout", "0.35",
-                "--edit_dropout", "0.35",
-                "--unary_dropout", "0.35",
-                "--weight_decay", "0.15",
+                "--d_latent", "256",
+                "--edit_hidden_dims", "256", "256",
+                "--unary_hidden_dims", "256", "256",
+                "--encoder_dropout", "0.30",
+                "--edit_dropout", "0.30",
+                "--unary_dropout", "0.30",
+                "--weight_decay", "0.10",
                 "--lr", "3e-4",
-                "--tau", "1.3",
-                "--student_temperature", "1.0",
-                "--lam", "0.0012",
+                "--tau", "0.20",
+                "--student_temperature", "0.50",
+                "--lam", "0.010",
                 "--use_anchor_bias",
                 "--seed", "44",
             ],
         ),
         (
-            # Tiny model with pairs — smallest capacity, highest pair L2.
-            "t4_pairs_tiny",
+            # Moderate τ but *checkpoint by dense_top1* — direct argmax-
+            # match objective at model-selection time. Pairs on, tiny head.
+            "t4_pairs_dense_top1_ckpt",
             [
-                "--d_latent", "160",
-                "--edit_hidden_dims", "160", "160",
-                "--unary_hidden_dims", "160", "160",
+                "--checkpoint_metric", "dense_top1",
+                "--d_latent", "192",
+                "--edit_hidden_dims", "192", "192",
+                "--unary_hidden_dims", "192", "192",
                 "--use_pairs",
                 "--pair_hidden_dims", "128", "128",
-                "--pair_dropout", "0.40",
-                "--pair_l2", "1e-3",
+                "--pair_dropout", "0.30",
+                "--pair_l2", "5e-4",
                 "--pair_topk_primitives", "10",
-                "--encoder_dropout", "0.30",
-                "--edit_dropout", "0.30",
-                "--unary_dropout", "0.30",
-                "--weight_decay", "0.12",
-                "--lr", "5e-4",
-                "--tau", "1.1",
-                "--student_temperature", "1.0",
-                "--lam", "0.001",
+                "--encoder_dropout", "0.25",
+                "--edit_dropout", "0.25",
+                "--unary_dropout", "0.25",
+                "--weight_decay", "0.08",
+                "--lr", "4e-4",
+                "--tau", "0.40",
+                "--student_temperature", "0.70",
+                "--lam", "0.006",
                 "--use_anchor_bias",
                 "--seed", "45",
             ],

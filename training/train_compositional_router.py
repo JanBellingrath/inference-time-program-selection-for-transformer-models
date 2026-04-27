@@ -33,7 +33,7 @@ import json
 import logging
 import os
 from collections import defaultdict
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -56,6 +56,7 @@ from routers.compositional_router import (
     LegalCatalogue,
     build_compressor,
     collate_compositional,
+    hard_ce_on_observed,
     load_artifacts,
     local_moebius_loss,
     softmax_ce_on_observed,
@@ -226,6 +227,7 @@ def _loss_on_batch(
     use_local_pair: bool = False,
     local_alpha: float = 0.0,
     local_pair_beta: float = 1.0,
+    use_hard_ce: bool = False,
 ) -> Dict[str, torch.Tensor]:
     encoder_input = batch["encoder_input"].to(device)
     attention_mask = batch["attention_mask"]
@@ -245,10 +247,16 @@ def _loss_on_batch(
     gathered = parts["gathered"]
     K = gathered.shape[1]
     pseudo_indices = torch.arange(K, device=device).unsqueeze(0).expand_as(obs_indices)
-    ce = softmax_ce_on_observed(
-        gathered, pseudo_indices, obs_deltas, obs_mask, tau,
-        student_temp=student_temp,
-    )
+    if use_hard_ce:
+        ce = hard_ce_on_observed(
+            gathered, pseudo_indices, obs_deltas, obs_mask,
+            student_temp=student_temp,
+        )
+    else:
+        ce = softmax_ce_on_observed(
+            gathered, pseudo_indices, obs_deltas, obs_mask, tau,
+            student_temp=student_temp,
+        )
     total = ce
     pair_reg = parts.get("pair_l2_mean")
     if use_pairs and pair_l2 > 0 and pair_reg is not None:
@@ -482,6 +490,7 @@ def _epoch(
     use_local_pair: bool = False,
     local_alpha: float = 0.0,
     local_pair_beta: float = 1.0,
+    use_hard_ce: bool = False,
 ) -> Dict[str, float]:
     is_train = optimizer is not None
     router.train(mode=is_train)
@@ -507,6 +516,7 @@ def _epoch(
             use_pairs=use_pairs, pair_l2=pair_l2, return_components=use_pairs,
             use_local_unary=use_local_unary, use_local_pair=use_local_pair,
             local_alpha=local_alpha, local_pair_beta=local_pair_beta,
+            use_hard_ce=use_hard_ce,
         )
         loss = out["loss"]
         if is_train:
@@ -701,6 +711,28 @@ def _split_indices(n: int, val_fraction: float, seed: int) -> tuple:
     return train_idx, val_idx
 
 
+def _carve_test_from_train(
+    train_idx: Sequence[int],
+    *,
+    holdout_count: int,
+    seed: int,
+) -> tuple[list[int], list[int]]:
+    """Deterministically carve a test holdout from the train split."""
+    train_idx = list(train_idx)
+    if holdout_count <= 0 or not train_idx:
+        return train_idx, []
+    max_take = max(0, len(train_idx) - 1)
+    take = min(int(holdout_count), max_take)
+    if take <= 0:
+        return train_idx, []
+    g = torch.Generator().manual_seed(int(seed) * 1009 + 7)
+    perm = torch.randperm(len(train_idx), generator=g).tolist()
+    test_pick = set(perm[:take])
+    test_idx = [train_idx[i] for i in range(len(train_idx)) if i in test_pick]
+    kept_train = [train_idx[i] for i in range(len(train_idx)) if i not in test_pick]
+    return kept_train, test_idx
+
+
 def train_one_router(
     artifacts: CompositionalArtifacts,
     *,
@@ -755,6 +787,10 @@ def train_one_router(
     local_pair_beta: float = 1.0,
     checkpoint_metric: str = "loss",
     use_anchor_bias: bool = False,
+    epoch_report_callback: Optional[Callable[[int, Dict[str, float]], None]] = None,
+    train_test_holdout_count: int = 0,
+    split_json_path: Optional[_Path] = None,
+    use_hard_ce: bool = False,
 ) -> Optional[Dict[str, Any]]:
     torch.manual_seed(seed)
     log_prefix = f"{wandb_prefix}/" if wandb_prefix else ""
@@ -787,7 +823,57 @@ def train_one_router(
         logger.error("no samples for benchmarks=%s; aborting", benchmarks)
         return None
 
-    train_idx, val_idx = _split_indices(len(dataset), val_fraction, seed)
+    if split_json_path is not None:
+        split_json_path = _Path(split_json_path)
+        with open(split_json_path) as _f:
+            _split_doc = json.load(_f)
+        _train_keys: set = set()
+        _val_keys: set = set()
+        _test_keys: set = set()
+        for _b, _info in _split_doc.get("benchmarks", {}).items():
+            for _q in _info.get("train_question_ids", []):
+                _train_keys.add((_b, int(_q)))
+            for _q in _info.get("val_question_ids", []):
+                _val_keys.add((_b, int(_q)))
+            for _q in _info.get("test_question_ids", []):
+                _test_keys.add((_b, int(_q)))
+        train_idx: List[int] = []
+        val_idx: List[int] = []
+        test_idx: List[int] = []
+        _unmapped = 0
+        for _i in range(len(dataset)):
+            _b = dataset.benchmark_names[_i]
+            _q = int(dataset.question_ids[_i])
+            _key = (_b, _q)
+            if _key in _train_keys:
+                train_idx.append(_i)
+            elif _key in _val_keys:
+                val_idx.append(_i)
+            elif _key in _test_keys:
+                test_idx.append(_i)
+            else:
+                _unmapped += 1
+        if _unmapped:
+            logger.warning(
+                "split_json=%s: %d dataset rows had (bench, qid) not in any split "
+                "— excluded from train/val/test.", split_json_path, _unmapped,
+            )
+        logger.info(
+            "[split_json] %s -> train=%d val=%d test=%d (of %d)",
+            split_json_path, len(train_idx), len(val_idx), len(test_idx), len(dataset),
+        )
+    else:
+        train_idx, val_idx = _split_indices(len(dataset), val_fraction, seed)
+        train_idx, test_idx = _carve_test_from_train(
+            train_idx,
+            holdout_count=int(train_test_holdout_count),
+            seed=seed,
+        )
+    if test_idx:
+        logger.info(
+            "train/test carve-out: train=%d val=%d test=%d (holdout_count=%d, val unchanged)",
+            len(train_idx), len(val_idx), len(test_idx), int(train_test_holdout_count),
+        )
     train_subset = Subset(dataset, train_idx)
     val_subset = Subset(dataset, val_idx) if val_idx else None
 
@@ -801,6 +887,7 @@ def train_one_router(
     # with the same ``seed``, giving a smooth monotone view of progress.
     eval_train_idx: Sequence[int] = train_idx
     eval_val_idx: Sequence[int] = val_idx
+    eval_test_idx: Sequence[int] = test_idx
     if downstream_eval_subset and downstream_eval_subset > 0:
         gen = torch.Generator().manual_seed(int(seed) * 997 + 13)
         if len(train_idx) > downstream_eval_subset:
@@ -809,10 +896,14 @@ def train_one_router(
         if len(val_idx) > downstream_eval_subset:
             perm = torch.randperm(len(val_idx), generator=gen).tolist()
             eval_val_idx = [val_idx[i] for i in perm[:downstream_eval_subset]]
+        if len(test_idx) > downstream_eval_subset:
+            perm = torch.randperm(len(test_idx), generator=gen).tolist()
+            eval_test_idx = [test_idx[i] for i in perm[:downstream_eval_subset]]
         logger.info(
-            "downstream eval subsample: train=%d/%d  val=%d/%d  (seed-pinned)",
+            "downstream eval subsample: train=%d/%d  val=%d/%d  test=%d/%d  (seed-pinned)",
             len(eval_train_idx), len(train_idx),
             len(eval_val_idx), len(val_idx),
+            len(eval_test_idx), len(test_idx),
         )
 
     # Capture the (benchmark, question_id) pair for every index on each
@@ -841,6 +932,7 @@ def train_one_router(
         "n_total": int(len(dataset)),
         "train": _pairs_for(train_idx),
         "val": _pairs_for(val_idx),
+        "test": _pairs_for(test_idx),
     }
 
     train_loader = DataLoader(
@@ -895,9 +987,9 @@ def train_one_router(
 
     n_params = sum(p.numel() for p in router.parameters() if p.requires_grad)
     logger.info(
-        "Router built: M=%d, |benchmarks|=%d, samples=%d (train=%d val=%d), params=%d",
+        "Router built: M=%d, |benchmarks|=%d, samples=%d (train=%d val=%d test=%d), params=%d",
         artifacts.num_primitives, len(catalogues_on_device), len(dataset),
-        len(train_subset), len(val_subset) if val_subset is not None else 0, n_params,
+        len(train_subset), len(val_subset) if val_subset is not None else 0, len(test_idx), n_params,
     )
 
     optimizer = torch.optim.AdamW(
@@ -920,6 +1012,7 @@ def train_one_router(
             use_dense_supervision=use_dense_supervision,
             use_local_unary=use_local_unary, use_local_pair=use_local_pair,
             local_alpha=local_alpha, local_pair_beta=local_pair_beta,
+            use_hard_ce=use_hard_ce,
         )
         train_loss = train_metrics["loss"]
         if val_loader is not None:
@@ -929,6 +1022,7 @@ def train_one_router(
                 use_dense_supervision=use_dense_supervision,
                 use_local_unary=use_local_unary, use_local_pair=use_local_pair,
                 local_alpha=local_alpha, local_pair_beta=local_pair_beta,
+                use_hard_ce=use_hard_ce,
             )
             val_loss = val_metrics_e["loss"]
         else:
@@ -941,7 +1035,9 @@ def train_one_router(
             "train_ce": train_metrics["ce"], "val_ce": val_metrics_e["ce"],
         })
         improved = False
+        current_ckpt_score = float("nan")
         if checkpoint_metric == "loss":
+            current_ckpt_score = float(val_loss)
             if val_loss < best_ckpt_score:
                 best_ckpt_score = val_loss
                 improved = True
@@ -952,6 +1048,7 @@ def train_one_router(
                 router, dataset, eval_val_idx, bench_id_to_catalogue, lam, device,
             )
             sc = float(dm_val_ckpt["mean_uplift"])
+            current_ckpt_score = sc
             if sc > best_ckpt_score:
                 best_ckpt_score = sc
                 improved = True
@@ -962,6 +1059,7 @@ def train_one_router(
                 router, dataset, eval_val_idx, bench_id_to_catalogue, lam, device,
             )
             sc = float(dm_val_ckpt["dense_top1_acc"])
+            current_ckpt_score = sc
             if sc > best_ckpt_score:
                 best_ckpt_score = sc
                 improved = True
@@ -970,11 +1068,24 @@ def train_one_router(
                 router, dataset, val_idx, bench_id_to_catalogue, lam, device,
             )
             sc = float(rk_val["obs_top1_acc"])
+            current_ckpt_score = sc
             if sc > best_ckpt_score:
                 best_ckpt_score = sc
                 improved = True
         else:
             raise SystemExit(f"unknown --checkpoint_metric {checkpoint_metric!r}")
+
+        if epoch_report_callback is not None:
+            epoch_report_callback(
+                int(epoch),
+                {
+                    "train_loss": float(train_loss),
+                    "val_loss": float(val_loss),
+                    "checkpoint_score": float(current_ckpt_score),
+                    "best_checkpoint_score": float(best_ckpt_score),
+                },
+            )
+
         best_val_loss_min = min(best_val_loss_min, val_loss)
         if improved:
             best_epoch = epoch
@@ -1062,12 +1173,24 @@ def train_one_router(
                                             lam, device)
     val_metrics = _delta_metrics_on_split(router, dataset, val_idx, bench_id_to_catalogue,
                                           lam, device)
+    has_test_holdout = len(test_idx) > 0
+    test_metrics: Optional[Dict[str, float]] = None
+    if has_test_holdout:
+        test_metrics = _delta_metrics_on_split(
+            router, dataset, test_idx, bench_id_to_catalogue, lam, device,
+        )
     train_rank = _ranking_metrics_on_split(router, dataset, train_idx, bench_id_to_catalogue,
                                            lam, device)
     val_rank = _ranking_metrics_on_split(router, dataset, val_idx, bench_id_to_catalogue,
                                          lam, device)
+    test_rank: Optional[Dict[str, float]] = None
+    if has_test_holdout:
+        test_rank = _ranking_metrics_on_split(
+            router, dataset, test_idx, bench_id_to_catalogue, lam, device,
+        )
     train_downstream: Optional[Dict[str, float]] = None
     val_downstream: Optional[Dict[str, float]] = None
+    test_downstream: Optional[Dict[str, float]] = None
     if has_dense:
         train_downstream = _downstream_metrics_on_split(
             router, dataset, train_idx, bench_id_to_catalogue, lam, device,
@@ -1075,15 +1198,33 @@ def train_one_router(
         val_downstream = _downstream_metrics_on_split(
             router, dataset, val_idx, bench_id_to_catalogue, lam, device,
         )
-        logger.info(
-            "Final downstream  train: router_acc=%.4f anchor=%.4f oracle=%.4f uplift=%+.4f  "
-            "val: router_acc=%.4f anchor=%.4f oracle=%.4f uplift=%+.4f best_fixed=%.4f",
-            train_downstream["router_acc"], train_downstream["anchor_acc"],
-            train_downstream["oracle_acc"], train_downstream["mean_uplift"],
-            val_downstream["router_acc"], val_downstream["anchor_acc"],
-            val_downstream["oracle_acc"], val_downstream["mean_uplift"],
-            val_downstream["best_fixed_acc"],
-        )
+        if has_test_holdout:
+            test_downstream = _downstream_metrics_on_split(
+                router, dataset, test_idx, bench_id_to_catalogue, lam, device,
+            )
+            logger.info(
+                "Final downstream  train: router_acc=%.4f anchor=%.4f oracle=%.4f uplift=%+.4f  "
+                "val: router_acc=%.4f anchor=%.4f oracle=%.4f uplift=%+.4f best_fixed=%.4f  "
+                "test: router_acc=%.4f anchor=%.4f oracle=%.4f uplift=%+.4f best_fixed=%.4f",
+                train_downstream["router_acc"], train_downstream["anchor_acc"],
+                train_downstream["oracle_acc"], train_downstream["mean_uplift"],
+                val_downstream["router_acc"], val_downstream["anchor_acc"],
+                val_downstream["oracle_acc"], val_downstream["mean_uplift"],
+                val_downstream["best_fixed_acc"],
+                test_downstream["router_acc"], test_downstream["anchor_acc"],
+                test_downstream["oracle_acc"], test_downstream["mean_uplift"],
+                test_downstream["best_fixed_acc"],
+            )
+        else:
+            logger.info(
+                "Final downstream  train: router_acc=%.4f anchor=%.4f oracle=%.4f uplift=%+.4f  "
+                "val: router_acc=%.4f anchor=%.4f oracle=%.4f uplift=%+.4f best_fixed=%.4f",
+                train_downstream["router_acc"], train_downstream["anchor_acc"],
+                train_downstream["oracle_acc"], train_downstream["mean_uplift"],
+                val_downstream["router_acc"], val_downstream["anchor_acc"],
+                val_downstream["oracle_acc"], val_downstream["mean_uplift"],
+                val_downstream["best_fixed_acc"],
+            )
     train_rank_unary: Optional[Dict[str, float]] = None
     val_rank_unary: Optional[Dict[str, float]] = None
     if use_pairs:
@@ -1103,18 +1244,33 @@ def train_one_router(
         val_metrics["mean_argmax_delta"], val_metrics["mean_best_observed"],
         val_metrics["frac_argmax_in_support"], val_metrics["frac_argmax_positive"],
     )
+    if has_test_holdout and test_metrics is not None:
+        logger.info(
+            "Δ-on-legal-set  test: argmax=%+.5f  best_obs=%+.5f  in_supp=%.3f  pos=%.3f",
+            test_metrics["mean_argmax_delta"], test_metrics["mean_best_observed"],
+            test_metrics["frac_argmax_in_support"], test_metrics["frac_argmax_positive"],
+        )
     logger.info(
         "Ranking (gold = argmax Δ among observed)  train: top1=%.4f top3=%.4f top5=%.4f  "
         "val: top1=%.4f top3=%.4f top5=%.4f",
         train_rank["top1_acc"], train_rank["top3_acc"], train_rank["top5_acc"],
         val_rank["top1_acc"], val_rank["top3_acc"], val_rank["top5_acc"],
     )
-    logger.info(
-        "Obs-only re-rank  train: top1=%.4f top3=%.4f top5=%.4f  "
-        "val: top1=%.4f top3=%.4f top5=%.4f",
-        train_rank["obs_top1_acc"], train_rank["obs_top3_acc"], train_rank["obs_top5_acc"],
-        val_rank["obs_top1_acc"], val_rank["obs_top3_acc"], val_rank["obs_top5_acc"],
-    )
+    if has_test_holdout and test_rank is not None:
+        logger.info(
+            "Obs-only re-rank  train: top1=%.4f top3=%.4f top5=%.4f  "
+            "val: top1=%.4f top3=%.4f top5=%.4f  test: top1=%.4f top3=%.4f top5=%.4f",
+            train_rank["obs_top1_acc"], train_rank["obs_top3_acc"], train_rank["obs_top5_acc"],
+            val_rank["obs_top1_acc"], val_rank["obs_top3_acc"], val_rank["obs_top5_acc"],
+            test_rank["obs_top1_acc"], test_rank["obs_top3_acc"], test_rank["obs_top5_acc"],
+        )
+    else:
+        logger.info(
+            "Obs-only re-rank  train: top1=%.4f top3=%.4f top5=%.4f  "
+            "val: top1=%.4f top3=%.4f top5=%.4f",
+            train_rank["obs_top1_acc"], train_rank["obs_top3_acc"], train_rank["obs_top5_acc"],
+            val_rank["obs_top1_acc"], val_rank["obs_top3_acc"], val_rank["obs_top5_acc"],
+        )
     if val_rank_unary is not None:
         logger.info(
             "Unary-only ablation  val: top1=%.4f top3=%.4f top5=%.4f  obs_top1=%.4f obs_top3=%.4f",
@@ -1123,10 +1279,16 @@ def train_one_router(
         )
     if wandb_run is not None:
         flat = {}
-        for split, m in [("train", train_metrics), ("val", val_metrics)]:
+        split_metric_rows = [("train", train_metrics), ("val", val_metrics)]
+        if has_test_holdout and test_metrics is not None:
+            split_metric_rows.append(("test", test_metrics))
+        for split, m in split_metric_rows:
             for k, v in m.items():
                 flat[f"{log_prefix}delta/{split}/{k}"] = v
-        for split, m in [("train", train_rank), ("val", val_rank)]:
+        split_rank_rows = [("train", train_rank), ("val", val_rank)]
+        if has_test_holdout and test_rank is not None:
+            split_rank_rows.append(("test", test_rank))
+        for split, m in split_rank_rows:
             for k, v in m.items():
                 flat[f"{log_prefix}rank/{split}/{k}"] = v
         if train_rank_unary is not None:
@@ -1134,7 +1296,10 @@ def train_one_router(
                 for k, v in m.items():
                     flat[f"{log_prefix}rank_unary_only/{split}/{k}"] = v
         if val_downstream is not None:
-            for split, m in [("train", train_downstream), ("val", val_downstream)]:
+            split_down_rows = [("train", train_downstream), ("val", val_downstream)]
+            if has_test_holdout and test_downstream is not None:
+                split_down_rows.append(("test", test_downstream))
+            for split, m in split_down_rows:
                 if m is None:
                     continue
                 for k, v in m.items():
@@ -1180,6 +1345,7 @@ def train_one_router(
             "local_pair_beta": local_pair_beta,
             "checkpoint_metric": checkpoint_metric,
             "use_anchor_bias": use_anchor_bias,
+            "use_hard_ce": use_hard_ce,
         },
         "benchmarks": list(benchmarks),
         "bench_to_id": bench_to_id,
@@ -1194,10 +1360,13 @@ def train_one_router(
             "val": val_metrics,
             "train_ranking": train_rank,
             "val_ranking": val_rank,
+            "test_ranking": test_rank,
             "train_ranking_unary_only": train_rank_unary,
             "val_ranking_unary_only": val_rank_unary,
             "train_downstream": train_downstream,
             "val_downstream": val_downstream,
+            "test_downstream": test_downstream,
+            "test": test_metrics,
         },
         "catalogue_dir": str(artifacts.output_dir),
     }
@@ -1323,6 +1492,14 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Add a learnable scalar to the anchor (row-0) program score. "
              "Breaks the structural pinning S_q(anchor)≡0 and lets CE place "
              "the anchor logit freely on the same scale as non-anchor programs.",
+    )
+    p.add_argument(
+        "--hard_ce", action="store_true",
+        help="Use hard cross-entropy on the observed candidate support "
+             "(target = one-hot on argmax observed Δ) instead of the "
+             "tempered soft distribution controlled by --tau. Intended for "
+             "MCTS-only supervision where each question has a small handful "
+             "of observed routes.",
     )
     p.add_argument("--device", default=None,
                    help="Override device (default: cuda if available, else cpu).")
@@ -1486,6 +1663,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         local_pair_beta=float(args.local_pair_beta),
         checkpoint_metric=str(args.checkpoint_metric),
         use_anchor_bias=bool(args.use_anchor_bias),
+        use_hard_ce=bool(args.hard_ce),
     )
 
     try:

@@ -21,7 +21,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Callable, Dict, Optional, Sequence
 
 import torch
 
@@ -118,7 +118,11 @@ def train_and_score_compositional(
     wandb_step_offset: int = 0,
     use_dense_supervision: Optional[bool] = None,
     downstream_eval_every: int = 0,
+    dense_keep_mask_paths: Optional[Dict[str, Path]] = None,
     local_moebius_paths: Optional[Dict[str, Path]] = None,
+    epoch_report_callback: Optional[Callable[[int, Dict[str, float]], None]] = None,
+    train_test_holdout_count: int = 0,
+    split_json_path: Optional[Path] = None,
 ) -> TrainResult:
     """Train a compositional router for one HPO trial; return a ``TrainResult``.
 
@@ -138,6 +142,7 @@ def train_and_score_compositional(
 
     benchmarks = list(benchmarks)
     dense_paths = dict(dense_paths or {})
+    dense_keep_mask_paths = dict(dense_keep_mask_paths or {})
 
     if use_dense_supervision is None:
         use_dense_supervision = bool(dense_paths) and objective_metric == "mean_uplift"
@@ -245,13 +250,21 @@ def train_and_score_compositional(
         dense_delta_paths=dense_paths or None,
         use_dense_supervision=bool(use_dense_supervision),
         downstream_eval_every=int(downstream_eval_every),
+        checkpoint_metric=(
+            "mean_uplift"
+            if objective_metric == "mean_uplift"
+            else "obs_top1"
+        ),
         observed_path_overrides=None,
-        dense_keep_mask_paths=None,
+        dense_keep_mask_paths=dense_keep_mask_paths or None,
         local_moebius_paths=local_paths_for_trial,
         use_local_unary=bool(moebius_cfg["use_local_unary"]),
         use_local_pair=bool(moebius_cfg["use_local_pair"]),
         local_alpha=float(moebius_cfg["local_alpha"]),
         local_pair_beta=float(moebius_cfg["local_pair_beta"]),
+        epoch_report_callback=epoch_report_callback,
+        train_test_holdout_count=int(train_test_holdout_count),
+        split_json_path=split_json_path,
     )
 
     if payload is None:

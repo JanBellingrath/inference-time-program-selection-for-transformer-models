@@ -194,7 +194,21 @@ def _define_hpo_wandb_charts(router_kind: str) -> None:
             ("hpo/val_obs_top1", "max"),
             ("hpo/val_obs_top3", "max"),
             ("hpo/val_obs_top5", "max"),
+            # Δ log P(correct) on val (nats). This is the metric optimized
+            # during training (checkpoint_metric=mean_uplift). An uplift of
+            # ~0.2 nats corresponds to a ~5pp increase in P(correct) on
+            # average; it is NOT a 20-point accuracy gain.
+            ("hpo/mean_uplift_nats", "max"),
+            # Kept for backward-compatibility with old W&B dashboards; it
+            # carries the same value as mean_uplift_nats (log-prob delta).
             ("hpo/mean_uplift_vs_anchor", "max"),
+            # Unconditional binary-accuracy gain in percentage points, from
+            # an external LLM eval. Only populated for trials that had
+            # their final checkpoint re-scored downstream; NaN otherwise.
+            ("hpo/mean_uplift_pp", "max"),
+            ("hpo/external_eval_n", "max"),
+            ("hpo/router_acc", "max"),
+            ("hpo/anchor_acc", "max"),
             ("hpo/uplift_vs_best_route", "max"),
             ("hpo/frac_oracle_uplift", "max"),
             ("hpo/dense_top1", "max"),
@@ -285,13 +299,32 @@ def _log_trial_wandb_compositional(
     if not isinstance(vr, dict):
         vr = {}
     r_acc = float(vd.get("router_acc", 0.0) or 0.0)
+    a_acc = float(vd.get("anchor_acc", 0.0) or 0.0)
     bf = float(vd.get("best_fixed_acc", 0.0) or 0.0)
-    # Order: val observability, downstream deltas vs baselines, then SMAC + run metadata.
+    mean_uplift_nats = float(vd.get("mean_uplift", 0.0) or 0.0)
+    # External LLM eval of final checkpoint (if provided by trainer /
+    # compositional_objective); reports the unconditional accuracy gain in
+    # percentage points. NaN / unset when no external eval was run.
+    ext = getattr(train_result, "compositional_external_eval", None) or {}
+    ext_uncond_gain_pp = float(ext.get("unconditional_gain_pp", float("nan")))
+    ext_router_acc = float(ext.get("router_acc", float("nan")))
+    ext_anchor_acc = float(ext.get("anchor_acc", float("nan")))
+    ext_n = int(ext.get("n", 0))
+    # Order: val observability, log-prob + pp uplifts, downstream deltas vs
+    # baselines, then SMAC + run metadata.
     out: Dict[str, Any] = {
         "hpo/val_obs_top1": float(vr.get("obs_top1_acc", 0.0) or 0.0),
         "hpo/val_obs_top3": float(vr.get("obs_top3_acc", 0.0) or 0.0),
         "hpo/val_obs_top5": float(vr.get("obs_top5_acc", 0.0) or 0.0),
-        "hpo/mean_uplift_vs_anchor": float(vd.get("mean_uplift", 0.0) or 0.0),
+        "hpo/mean_uplift_nats": mean_uplift_nats,
+        # Backward compatibility with older dashboards (same value as nats).
+        "hpo/mean_uplift_vs_anchor": mean_uplift_nats,
+        "hpo/mean_uplift_pp": ext_uncond_gain_pp,
+        "hpo/external_eval_n": ext_n,
+        "hpo/router_acc": r_acc,
+        "hpo/anchor_acc": a_acc,
+        "hpo/external_router_acc": ext_router_acc,
+        "hpo/external_anchor_acc": ext_anchor_acc,
         "hpo/uplift_vs_best_route": r_acc - bf,
         "hpo/frac_oracle_uplift": float(vd.get("frac_oracle", 0.0) or 0.0),
         "hpo/dense_top1": float(vd.get("dense_top1_acc", 0.0) or 0.0),
@@ -537,6 +570,7 @@ def build_target_function(
                     artifacts=ctx["artifacts"],
                     benchmarks=ctx["benchmarks"],
                     dense_paths=ctx.get("dense_paths") or {},
+                    dense_keep_mask_paths=ctx.get("dense_keep_mask_paths") or None,
                     scope=ctx.get("scope", "single"),
                     router_epochs=router_e,
                     batch_size=int(ctx.get("batch_size", 64)),
@@ -545,10 +579,15 @@ def build_target_function(
                     device=device,
                     objective_metric=ctx.get("objective_metric", "mean_uplift"),
                     use_full_sequence=bool(ctx.get("use_full_sequence", False)),
-                    wandb_run=None,
-                    use_dense_supervision=None,
+                    wandb_run=wandb_run,
+                    wandb_prefix=f"trial_{trial_idx:05d}",
+                    wandb_step_offset=int(trial_idx) * 1000,
+                    use_dense_supervision=(
+                        True if ctx.get("objective_metric", "mean_uplift") == "mean_uplift" else None
+                    ),
                     downstream_eval_every=0,
                     local_moebius_paths=ctx.get("local_moebius_paths") or None,
+                    train_test_holdout_count=int(ctx.get("train_test_holdout_count", 0)),
                 )
 
                 full_train = is_full_training_budget(budget, max_budget)

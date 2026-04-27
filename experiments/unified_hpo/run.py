@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""CLI entrypoint for the unified SMAC HPO.
+"""CLI entrypoint for unified HPO backends (SMAC or Optuna).
 
-Loads routing data once, sets up SMAC with ``MultiFidelityFacade`` (Hyperband
-**training** budgets: scaled router/gate epochs). Calibration always uses the
-full routing-val split.  Optionally runs post-HPO confirmation on the top-K
-configurations.
+Loads routing data once, then dispatches to the selected backend:
+SMAC (Hyperband training budgets) or Optuna (full-budget trials first).
+Calibration always uses the full routing-val split. Optionally runs post-HPO
+confirmation on the top-K configurations.
 
 Usage::
 
@@ -200,6 +200,37 @@ def _parse_dense_deltas(entries: Optional[List[str]]) -> Dict[str, Path]:
     return out
 
 
+def _parse_dense_keep_masks(entries: Optional[List[str]]) -> Dict[str, Path]:
+    """Parse ``--dense_keep_masks bench=path`` repeated entries to a dict."""
+    out: Dict[str, Path] = {}
+    if not entries:
+        return out
+    for e in entries:
+        if "=" not in e:
+            raise SystemExit(f"--dense_keep_masks expects bench=path, got {e!r}")
+        bench, path = e.split("=", 1)
+        p = Path(path)
+        if not p.is_file():
+            raise SystemExit(f"dense keep-mask file not found: {p}")
+        out[bench] = p
+    return out
+
+
+def _parse_dense_keep_mask_dir(dir_path: Optional[str], benchmarks: List[str]) -> Dict[str, Path]:
+    """Load per-benchmark keep masks from ``<dir>/<bench>.pt`` when provided."""
+    out: Dict[str, Path] = {}
+    if not dir_path:
+        return out
+    d = Path(dir_path)
+    if not d.is_dir():
+        raise SystemExit(f"--dense_keep_mask_dir not a directory: {d}")
+    for bench in benchmarks:
+        p = d / f"{bench}.pt"
+        if p.is_file():
+            out[bench] = p
+    return out
+
+
 def _load_data_compositional(args) -> Dict[str, Any]:
     """Load compositional artifacts (catalogue + residuals) once.
 
@@ -241,6 +272,20 @@ def _load_data_compositional(args) -> Dict[str, Any]:
                 f"--dense_deltas references benchmarks not in --benchmarks: {unknown!r}"
             )
 
+    dense_keep_paths = _parse_dense_keep_masks(getattr(args, "dense_keep_masks", None))
+    dense_keep_paths_from_dir = _parse_dense_keep_mask_dir(
+        getattr(args, "dense_keep_mask_dir", None),
+        benchmarks,
+    )
+    # Explicit bench=path entries win over directory auto-discovery.
+    dense_keep_paths = {**dense_keep_paths_from_dir, **dense_keep_paths}
+    if dense_keep_paths:
+        unknown_masks = [b for b in dense_keep_paths if b not in benchmarks]
+        if unknown_masks:
+            raise SystemExit(
+                f"--dense_keep_masks references benchmarks not in --benchmarks: {unknown_masks!r}"
+            )
+
     if args.objective_metric == "mean_uplift" and not dense_paths:
         raise SystemExit(
             "--objective_metric mean_uplift requires --dense_deltas bench=path "
@@ -276,7 +321,11 @@ def _load_data_compositional(args) -> Dict[str, Any]:
 
     # Probe d_model from a tiny dataset slice (one benchmark).
     probe_bench = benchmarks[0]
-    probe_dataset = CompositionalDataset(artifacts, benchmarks=[probe_bench])
+    probe_dataset = CompositionalDataset(
+        artifacts,
+        benchmarks=[probe_bench],
+        dense_keep_mask_paths=dense_keep_paths or None,
+    )
     if not probe_dataset.encoder_inputs:
         raise SystemExit(
             f"compositional dataset for {probe_bench!r} is empty; cannot infer d_model."
@@ -284,11 +333,19 @@ def _load_data_compositional(args) -> Dict[str, Any]:
     d_model = int(probe_dataset.encoder_inputs[0].shape[-1])
     n_samples = len(probe_dataset)
 
+    train_test_holdout_count = int(getattr(args, "compositional_train_test_holdout_count", 0))
+    if train_test_holdout_count > 0:
+        logger.info(
+            "Compositional train/test holdout enabled: holdout=%d (val unchanged)",
+            train_test_holdout_count,
+        )
+
     logger.info(
         "Compositional data loaded: scope=%s benchmarks=%s d_model=%d "
-        "probe_samples(%s)=%d dense_paths=%s",
+        "probe_samples(%s)=%d dense_paths=%s dense_keep_masks=%s",
         args.scope, benchmarks, d_model, probe_bench, n_samples,
         {b: str(p) for b, p in dense_paths.items()},
+        {b: str(p) for b, p in dense_keep_paths.items()},
     )
 
     return {
@@ -296,6 +353,7 @@ def _load_data_compositional(args) -> Dict[str, Any]:
         "artifacts": artifacts,
         "benchmarks": benchmarks,
         "dense_paths": dense_paths,
+        "dense_keep_mask_paths": dense_keep_paths or None,
         "local_moebius_paths": local_moebius_paths or None,
         "scope": args.scope,
         "d_model": d_model,
@@ -303,6 +361,8 @@ def _load_data_compositional(args) -> Dict[str, Any]:
         "objective_metric": args.objective_metric,
         "val_fraction": float(args.val_fraction),
         "batch_size": int(args.batch_size),
+        "train_test_holdout_count": int(train_test_holdout_count),
+        "split_json_path": getattr(args, "split_json", None),
     }
 
 
@@ -493,9 +553,13 @@ def _run_confirmation(
 # CLI
 # ---------------------------------------------------------------------------
 
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Unified SMAC + Hyperband (training epochs) for fine / compositional routers",
+def parse_args(default_backend: str = "smac"):
+    p = argparse.ArgumentParser(description="Unified HPO for fine / compositional routers")
+    p.add_argument(
+        "--hpo_backend",
+        choices=["smac", "optuna"],
+        default=default_backend,
+        help="HPO orchestrator backend. 'smac' keeps Hyperband budgets; 'optuna' runs full-budget trials.",
     )
     p.add_argument("--router_kind", choices=["fine", "compositional"], default="fine",
                    help="Which router family to optimize. Default 'fine' preserves the "
@@ -519,6 +583,12 @@ def parse_args():
     p.add_argument("--dense_deltas", type=str, nargs="+", default=None,
                    help="(compositional) bench=path entries with dense Δ matrices "
                         "(produced by data_prep.import_mined_dense_matrix or dr-llm).")
+    p.add_argument("--dense_keep_masks", type=str, nargs="+", default=None,
+                   help="(compositional) optional bench=path entries to keep_mask .pt files "
+                        "that restrict dense supervision to a reduced route catalogue.")
+    p.add_argument("--dense_keep_mask_dir", type=str, default=None,
+                   help="(compositional) directory containing {bench}.pt keep-mask files; "
+                        "used to restrict dense supervision to selected routes.")
     p.add_argument("--local_moebius_dir", type=str, default=None,
                    help="(compositional) directory with local-Möbius target .pt "
                         "files (produced by data_prep.build_local_moebius_targets). "
@@ -536,12 +606,21 @@ def parse_args():
                    help="(compositional) train/val split fraction for the inner trainer.")
     p.add_argument("--batch_size", type=int, default=64,
                    help="(compositional) batch size for the inner trainer.")
+    p.add_argument("--compositional_train_test_holdout_count", type=int, default=0,
+                   help="(compositional) optional count to carve from train into test. "
+                        "Validation split is unchanged. Default 0 disables test carve-out.")
+    p.add_argument("--split_json", type=Path, default=None,
+                   help="(compositional) path to canonical train/val/test split JSON "
+                        "produced by scripts/make_canonical_split.py. When set, ALL "
+                        "trials in the sweep use the exact same split — matching the "
+                        "one used by the catalogue-builder, so no validation Δ mass "
+                        "leaks into the retained catalogue.")
     p.add_argument("--output_dir", type=str, default="hpo_results",
-                   help="Output directory for SMAC state, archive, and best models")
+                   help="Output directory for HPO state, archive, and best models")
     p.add_argument("--wandb_project", type=str, default="unified-fine-routing-hpo")
     p.add_argument("--wandb_run_name", type=str, default=None)
     p.add_argument("--n_trials", type=int, default=100,
-                   help="Maximum number of SMAC trials")
+                   help="Maximum number of HPO trials")
     p.add_argument(
         "--min_budget", type=float, default=9.0,
         help="Minimum Hyperband training budget (maps to fewer router/gate epochs)",
@@ -554,6 +633,18 @@ def parse_args():
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--walltime_limit", type=float, default=float("inf"),
                    help="Maximum wall time in seconds for the optimization")
+    p.add_argument(
+        "--optuna_pruner",
+        choices=["none", "median", "hyperband"],
+        default="none",
+        help="Pruner used by Optuna backend. Keep 'none' for first migration pass.",
+    )
+    p.add_argument(
+        "--optuna_intermediate_metric",
+        choices=["objective", "val_loss"],
+        default="objective",
+        help="Metric reported per epoch for Optuna pruning.",
+    )
 
     # Expensive evaluation
     p.add_argument("--enable_expensive_eval", action="store_true",
@@ -573,28 +664,65 @@ def parse_args():
         "--resume",
         choices=["yes", "no"],
         default="no",
-        help="yes: keep SMAC state under output_dir (overwrite=false); append to "
-             "threshold_prior_archive.jsonl; set trial index from archive size; load "
-             "best_routing_system_*/meta.json. Same n_trials/seed/budgets/configspace as "
-             "the saved run. no: new SMAC run (wipes smac3_output for this scenario). "
-             "W&B: starts a new run unless you set WANDB_RUN_ID+resume. Per-trial metrics "
-             "are flat ``hpo/*`` with step = trial index (continues from archive when resuming).",
+        help="yes: resume from backend state in output_dir (SMAC scenario or Optuna sqlite) "
+             "and append to threshold_prior_archive.jsonl. no: start a fresh run state.",
     )
 
     return p.parse_args()
 
 
-def main():
-    args = parse_args()
+def _acquire_output_dir_lock(output_dir: str) -> Optional[int]:
+    """Create + exclusively lock a ``.hpo_lock`` file under ``output_dir``.
+
+    Prevents two concurrent ``python -m experiments.unified_hpo.run`` jobs
+    from writing interleaved / overwriting W&B runs and Optuna study state
+    in the same output directory — the duplicate-process bug that caused
+    sparse / non-adjacent logging in the first non-FT CSQA sweep.
+
+    Returns the file descriptor to keep open for the lifetime of the run
+    (the lock auto-releases on process exit). Raises SystemExit on a
+    conflict so the second launcher fails loudly instead of corrupting
+    logging.
+    """
+    import fcntl
+    os.makedirs(output_dir, exist_ok=True)
+    lock_path = os.path.join(output_dir, ".hpo_lock")
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        try:
+            existing = os.read(fd, 1024).decode("utf-8", errors="replace").strip()
+        except Exception:
+            existing = "<unreadable>"
+        os.close(fd)
+        raise SystemExit(
+            f"[hpo-lock] another unified_hpo.run process is already writing to "
+            f"{output_dir!r} (lock file: {lock_path!r}, holder: {existing}). "
+            f"Kill the running process or pick a different --output_dir."
+        )
+    # Record pid + host for forensics; truncate first.
+    os.ftruncate(fd, 0)
+    try:
+        host = os.uname().nodename
+    except Exception:
+        host = "unknown"
+    os.write(fd, f"pid={os.getpid()} host={host} t={time.time():.0f}\n".encode())
+    return fd
+
+
+def main(default_backend: str = "smac"):
+    args = parse_args(default_backend=default_backend)
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if args.no_wandb:
         os.environ["WANDB_MODE"] = "disabled"
 
-    resume = args.resume == "yes"
+    # Guard against duplicate HPO processes corrupting W&B / Optuna state.
+    _hpo_lock_fd = _acquire_output_dir_lock(args.output_dir)
 
-    from experiments.unified_hpo.smac_runner import run_smac_optimization
+    resume = args.resume == "yes"
 
     if args.router_kind == "fine":
         if not args.data_dir or not args.benchmark or not args.results_dir:
@@ -604,30 +732,53 @@ def main():
         data = _load_data(args)
         expensive_eval_fn = _build_expensive_eval_fn(args, data)
 
-        archive = run_smac_optimization(
-            router_kind="fine",
-            residuals=data["residuals"],
-            gate_labels=data["gate_labels"],
-            records=data["records"],
-            seq_to_idx=data["seq_to_idx"],
-            num_classes=data["num_classes"],
-            best_deltas=data["best_deltas"],
-            sequence_catalog=data["sequence_catalog"],
-            d_model=data["d_model"],
-            device=device,
-            benchmark=args.benchmark,
-            output_dir=args.output_dir,
-            wandb_project=args.wandb_project,
-            wandb_run_name=args.wandb_run_name,
-            n_trials=args.n_trials,
-            min_budget=args.min_budget,
-            max_budget=args.max_budget,
-            enable_expensive_eval=args.enable_expensive_eval,
-            expensive_eval_fn=expensive_eval_fn,
-            seed=args.seed,
-            walltime_limit=args.walltime_limit,
-            resume=resume,
-        )
+        if args.hpo_backend == "smac":
+            from experiments.unified_hpo.smac_runner import run_smac_optimization
+            archive = run_smac_optimization(
+                router_kind="fine",
+                residuals=data["residuals"],
+                gate_labels=data["gate_labels"],
+                records=data["records"],
+                seq_to_idx=data["seq_to_idx"],
+                num_classes=data["num_classes"],
+                best_deltas=data["best_deltas"],
+                sequence_catalog=data["sequence_catalog"],
+                d_model=data["d_model"],
+                device=device,
+                benchmark=args.benchmark,
+                output_dir=args.output_dir,
+                wandb_project=args.wandb_project,
+                wandb_run_name=args.wandb_run_name,
+                n_trials=args.n_trials,
+                min_budget=args.min_budget,
+                max_budget=args.max_budget,
+                enable_expensive_eval=args.enable_expensive_eval,
+                expensive_eval_fn=expensive_eval_fn,
+                seed=args.seed,
+                walltime_limit=args.walltime_limit,
+                resume=resume,
+            )
+        else:
+            from experiments.unified_hpo.optuna_runner import run_optuna_optimization
+            archive = run_optuna_optimization(
+                router_kind="fine",
+                ctx={**data, "expensive_eval_fn": expensive_eval_fn},
+                d_model=data["d_model"],
+                device=device,
+                benchmark=args.benchmark,
+                output_dir=args.output_dir,
+                wandb_project=args.wandb_project,
+                wandb_run_name=args.wandb_run_name,
+                n_trials=args.n_trials,
+                min_budget=args.min_budget,
+                max_budget=args.max_budget,
+                enable_expensive_eval=args.enable_expensive_eval,
+                seed=args.seed,
+                walltime_limit=args.walltime_limit,
+                resume=resume,
+                optuna_pruner=args.optuna_pruner,
+                optuna_intermediate_metric=args.optuna_intermediate_metric,
+            )
 
         if args.confirm_top_k > 0:
             archive_path = os.path.join(args.output_dir, "threshold_prior_archive.jsonl")
@@ -644,24 +795,47 @@ def main():
             data["benchmarks"][0] if data["scope"] == "single"
             else "+".join(data["benchmarks"])
         )
-        archive = run_smac_optimization(
-            router_kind="compositional",
-            compositional_ctx=data,
-            d_model=data["d_model"],
-            device=device,
-            benchmark=bench_label,
-            output_dir=args.output_dir,
-            wandb_project=args.wandb_project,
-            wandb_run_name=args.wandb_run_name,
-            n_trials=args.n_trials,
-            min_budget=args.min_budget,
-            max_budget=args.max_budget,
-            enable_expensive_eval=False,
-            expensive_eval_fn=None,
-            seed=args.seed,
-            walltime_limit=args.walltime_limit,
-            resume=resume,
-        )
+        if args.hpo_backend == "smac":
+            from experiments.unified_hpo.smac_runner import run_smac_optimization
+            archive = run_smac_optimization(
+                router_kind="compositional",
+                compositional_ctx=data,
+                d_model=data["d_model"],
+                device=device,
+                benchmark=bench_label,
+                output_dir=args.output_dir,
+                wandb_project=args.wandb_project,
+                wandb_run_name=args.wandb_run_name,
+                n_trials=args.n_trials,
+                min_budget=args.min_budget,
+                max_budget=args.max_budget,
+                enable_expensive_eval=False,
+                expensive_eval_fn=None,
+                seed=args.seed,
+                walltime_limit=args.walltime_limit,
+                resume=resume,
+            )
+        else:
+            from experiments.unified_hpo.optuna_runner import run_optuna_optimization
+            archive = run_optuna_optimization(
+                router_kind="compositional",
+                ctx=data,
+                d_model=data["d_model"],
+                device=device,
+                benchmark=bench_label,
+                output_dir=args.output_dir,
+                wandb_project=args.wandb_project,
+                wandb_run_name=args.wandb_run_name,
+                n_trials=args.n_trials,
+                min_budget=args.min_budget,
+                max_budget=args.max_budget,
+                enable_expensive_eval=False,
+                seed=args.seed,
+                walltime_limit=args.walltime_limit,
+                resume=resume,
+                optuna_pruner=args.optuna_pruner,
+                optuna_intermediate_metric=args.optuna_intermediate_metric,
+            )
         if args.confirm_top_k > 0:
             logger.warning(
                 "--confirm_top_k is not implemented for --router_kind compositional; "

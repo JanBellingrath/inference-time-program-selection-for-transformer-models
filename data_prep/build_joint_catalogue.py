@@ -82,33 +82,11 @@ from data_prep.build_compositional_catalogues import (
     build_pair_incidence_tensor,
     _save_incidence,
     _save_pair_incidence,
-    _write_legal_programs,
 )
+from data_prep.common.io import load_json, load_torch, read_jsonl, save_torch, write_jsonl
+from data_prep.common.manifests import write_manifest
 
 logger = logging.getLogger("build_joint_catalogue")
-
-
-# ---------------------------------------------------------------------------
-# IO helpers
-# ---------------------------------------------------------------------------
-
-
-def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rows.append(json.loads(line))
-    return rows
-
-
-def _write_jsonl(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        for r in rows:
-            f.write(json.dumps(r) + "\n")
 
 
 def _sorted_by_idx(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -133,7 +111,7 @@ def _load_per_bench_legal_programs(
         if info is None:
             raise KeyError(f"benchmark {b!r} not in manifest {catalogue_dir/'manifest.json'}")
         legal_path = catalogue_dir / info["legal_programs_path"]
-        out[b] = _sorted_by_idx(_read_jsonl(legal_path))
+        out[b] = _sorted_by_idx(read_jsonl(legal_path))
     return out
 
 
@@ -248,11 +226,17 @@ def _remap_dense_matrix(
 def _positive_mass_per_row_from_dense(
     joint_dense_per_bench: Dict[str, Optional[torch.Tensor]],
     joint_keep_mask_per_bench: Dict[str, torch.Tensor],
+    train_question_ids_per_bench: Optional[Dict[str, set]] = None,
 ) -> torch.Tensor:
     """``mass[r] = Σ_b Σ_q max(0, Δ_b(q,r)) · keep_b(r)``.
 
     Uses ``float64`` accumulation for numerical stability across many
     benchmarks / questions.
+
+    When ``train_question_ids_per_bench`` is provided, restricts the inner
+    sum over ``q`` to rows whose question id is in the set for that
+    benchmark. The dense matrix is expected to be row-indexed by
+    ``question_id`` (canonical compositional convention).
     """
     N_joint = next(iter(joint_keep_mask_per_bench.values())).numel()
     mass = torch.zeros(N_joint, dtype=torch.float64)
@@ -260,7 +244,26 @@ def _positive_mass_per_row_from_dense(
         if dm is None:
             continue
         km = joint_keep_mask_per_bench[b].to(torch.float64)
-        mass += dm.clamp(min=0.0).to(torch.float64).sum(dim=0) * km
+        dm_f = dm.clamp(min=0.0).to(torch.float64)
+        if train_question_ids_per_bench is not None:
+            train_qids = train_question_ids_per_bench.get(b)
+            if train_qids is None or not train_qids:
+                logger.warning(
+                    "train_question_ids for bench %s is empty/missing; "
+                    "falling back to full mass (no leakage protection).", b,
+                )
+            else:
+                Qb = int(dm_f.shape[0])
+                idx = [q for q in train_qids if 0 <= int(q) < Qb]
+                if len(idx) != Qb:
+                    logger.info(
+                        "[mass-coverage] bench=%s restricting mass to %d/%d "
+                        "train rows (dense has %d, %d excluded as val/test/unknown)",
+                        b, len(idx), Qb, Qb, Qb - len(idx),
+                    )
+                sel = torch.tensor(sorted(idx), dtype=torch.long)
+                dm_f = dm_f.index_select(0, sel)
+        mass += dm_f.sum(dim=0) * km
     return mass
 
 
@@ -268,22 +271,44 @@ def _positive_mass_per_row_from_observed(
     observed_per_bench: Dict[str, List[Dict[str, Any]]],
     bench_row_to_joint: Dict[str, Dict[int, int]],
     N_joint: int,
+    train_question_ids_per_bench: Optional[Dict[str, set]] = None,
 ) -> torch.Tensor:
     """Fallback when no dense matrices are provided.
 
     Sums ``max(0, Δ)`` over observed ``(row, delta)`` pairs, mapped into
     the joint row space. Rows never observed on any benchmark get 0.
+
+    When ``train_question_ids_per_bench`` is provided, restricts the sum
+    to records whose question id is in the train set.
     """
     mass = torch.zeros(N_joint, dtype=torch.float64)
     for b, records in observed_per_bench.items():
         rmap = bench_row_to_joint[b]
+        train_set: Optional[set] = (
+            train_question_ids_per_bench.get(b)
+            if train_question_ids_per_bench is not None
+            else None
+        )
+        n_used = 0
+        n_skipped = 0
         for rec in records:
+            if train_set is not None and train_set:
+                qid = int(rec.get("question_id", rec.get("residual_idx", -1)))
+                if qid not in train_set:
+                    n_skipped += 1
+                    continue
+            n_used += 1
             for r_b, d in zip(rec.get("obs_indices", []), rec.get("obs_deltas", [])):
                 r_joint = rmap.get(int(r_b))
                 if r_joint is None:
                     continue
                 if d > 0:
                     mass[r_joint] += float(d)
+        if train_set is not None and train_set:
+            logger.info(
+                "[mass-coverage] bench=%s observed mass: used %d rows, skipped %d (val/test)",
+                b, n_used, n_skipped,
+            )
     return mass
 
 
@@ -334,6 +359,8 @@ def build_joint_catalogue(
     benchmarks: Optional[Sequence[str]] = None,
     dense_delta_paths: Optional[Dict[str, Path]] = None,
     mass_coverage: Optional[float] = None,
+    train_question_ids_per_bench: Optional[Dict[str, Sequence[int]]] = None,
+    split_json_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Build a joint compositional catalogue (union of canonical programs).
 
@@ -362,8 +389,7 @@ def build_joint_catalogue(
     (output_dir / "observed").mkdir(parents=True, exist_ok=True)
 
     manifest_path = catalogue_dir / "manifest.json"
-    with open(manifest_path) as f:
-        source_manifest = json.load(f)
+    source_manifest = load_json(manifest_path)
 
     selected = list(benchmarks) if benchmarks else list(source_manifest["benchmarks"].keys())
     if not selected:
@@ -392,7 +418,7 @@ def build_joint_catalogue(
     joint_anchor_per_bench: Dict[str, Optional[torch.Tensor]] = {}
     for b in selected:
         if b in dense_delta_paths:
-            raw = torch.load(dense_delta_paths[b], map_location="cpu", weights_only=False)
+            raw = load_torch(dense_delta_paths[b])
             if "delta_matrix" not in raw or "anchor_utilities" not in raw:
                 raise KeyError(f"{dense_delta_paths[b]}: missing delta_matrix / anchor_utilities")
             dm_j, au = _remap_dense_matrix(raw, bench_row_to_joint[b], N_joint_union)
@@ -405,24 +431,58 @@ def build_joint_catalogue(
     observed_per_bench: Dict[str, List[Dict[str, Any]]] = {}
     for b in selected:
         obs_path = catalogue_dir / source_manifest["benchmarks"][b]["observed_path"]
-        observed_per_bench[b] = _read_jsonl(obs_path)
+        observed_per_bench[b] = read_jsonl(obs_path)
 
     # --- Optional mass-coverage pruning ------------------------------------
     pruning_info: Dict[str, Any] = {
         "mass_coverage": mass_coverage,
         "n_joint_before_prune": N_joint_union,
     }
+    # Resolve train question ids for mass-coverage leakage protection.
+    train_qids_sets: Optional[Dict[str, set]] = None
+    if split_json_path is not None:
+        with open(Path(split_json_path)) as f:
+            split_doc = json.load(f)
+        if "benchmarks" not in split_doc:
+            raise ValueError(
+                f"{split_json_path}: missing top-level 'benchmarks' key"
+            )
+        train_qids_sets = {}
+        for b in selected:
+            info = split_doc["benchmarks"].get(b)
+            if info is None:
+                raise ValueError(
+                    f"{split_json_path}: no split info for benchmark {b}; "
+                    f"present = {sorted(split_doc['benchmarks'].keys())}"
+                )
+            train_qids_sets[b] = {int(x) for x in info.get("train_question_ids", [])}
+        pruning_info["split_json_path"] = str(split_json_path)
+        pruning_info["train_qids_count_per_bench"] = {
+            b: len(v) for b, v in train_qids_sets.items()
+        }
+    elif train_question_ids_per_bench is not None:
+        train_qids_sets = {
+            b: {int(x) for x in (train_question_ids_per_bench.get(b) or [])}
+            for b in selected
+        }
+        pruning_info["train_qids_count_per_bench"] = {
+            b: len(v) for b, v in train_qids_sets.items()
+        }
+
     if mass_coverage is not None:
         if any(dm is not None for dm in joint_dense_per_bench.values()):
             mass = _positive_mass_per_row_from_dense(
                 joint_dense_per_bench, joint_keep_mask_per_bench,
+                train_question_ids_per_bench=train_qids_sets,
             )
             pruning_info["mass_source"] = "dense"
         else:
             mass = _positive_mass_per_row_from_observed(
                 observed_per_bench, bench_row_to_joint, N_joint_union,
+                train_question_ids_per_bench=train_qids_sets,
             )
             pruning_info["mass_source"] = "observed"
+        pruning_info["train_only_mass"] = train_qids_sets is not None
         kept_rows = _select_rows_for_mass_coverage(mass, coverage=float(mass_coverage))
         pruning_info["total_positive_mass"] = float(mass.sum().item())
         pruning_info["kept_positive_mass"] = float(mass[kept_rows].sum().item())
@@ -524,7 +584,7 @@ def build_joint_catalogue(
             remapped.append(new_rec)
             n_rows_kept += 1
         out_obs_path = output_dir / "observed" / f"{b}.jsonl"
-        _write_jsonl(out_obs_path, remapped)
+        write_jsonl(out_obs_path, remapped)
         stats[b] = {
             "rows_in": n_rows_in,
             "rows_kept": n_rows_kept,
@@ -546,15 +606,15 @@ def build_joint_catalogue(
                 "n_programs": N_joint,
                 "source_bench": b,
             }
-            torch.save(payload, dense_out_dir / f"{b}.pt")
+            save_torch(dense_out_dir / f"{b}.pt", payload)
         mask_out_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(
+        save_torch(
+            mask_out_dir / f"{b}.pt",
             {
                 "keep_mask": joint_keep_mask_per_bench[b].contiguous(),
                 "n_joint": N_joint,
                 "n_measured": int(joint_keep_mask_per_bench[b].sum().item()),
             },
-            mask_out_dir / f"{b}.pt",
         )
 
     # --- Copy primitives.jsonl + assemble manifest ------------------------
@@ -611,8 +671,7 @@ def build_joint_catalogue(
         "benchmarks": manifest_benchmarks,
         "elapsed_sec": round(time.time() - t0, 3),
     }
-    with open(output_dir / "manifest.json", "w") as f:
-        json.dump(manifest, f, indent=2)
+    write_manifest(output_dir / "manifest.json", manifest)
     logger.info(
         "joint catalogue written: N_joint=%d P=%d  (%.2fs) -> %s",
         N_joint, int(pair_index.shape[0]), manifest["elapsed_sec"], output_dir,
@@ -656,6 +715,12 @@ def _build_argparser() -> argparse.ArgumentParser:
                    help="When set in (0, 1], prune joint rows to the smallest prefix "
                         "covering this fraction of total positive Δ mass. Row 0 (anchor) "
                         "is always kept.")
+    p.add_argument("--split_json", type=Path, default=None,
+                   help="Path to a canonical train/val/test split JSON (produced by "
+                        "scripts/make_canonical_split.py). When set, mass-coverage "
+                        "pruning restricts the Q-sum to train_question_ids only, "
+                        "avoiding leakage of validation/test information into the "
+                        "retained catalogue.")
     p.add_argument("--log_level", default="INFO")
     return p
 
@@ -673,6 +738,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         benchmarks=args.benchmarks,
         dense_delta_paths=dense_paths,
         mass_coverage=args.mass_coverage,
+        split_json_path=args.split_json,
     )
     return 0
 

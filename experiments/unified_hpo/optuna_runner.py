@@ -7,6 +7,7 @@ import logging
 import os
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import optuna
@@ -64,6 +65,133 @@ def _build_pruner(
     raise ValueError(f"unknown optuna pruner: {kind!r}")
 
 
+def _should_run_posthoc_external_eval(
+    *,
+    router_kind: str,
+    mode: str,
+    ctx: Dict[str, Any],
+) -> bool:
+    if router_kind != "compositional":
+        return False
+    mode = str(mode).strip().lower()
+    if mode == "off":
+        return False
+    if mode == "best_only":
+        return True
+    if mode != "auto":
+        raise ValueError(
+            f"unknown compositional external eval mode={mode!r} "
+            f"(expected 'auto', 'best_only', or 'off')"
+        )
+    # Auto: run post-hoc LLM eval when we do NOT have dense supervision.
+    # Dense val metrics are available in-training only when dense paths exist.
+    return not bool(ctx.get("dense_paths") or {})
+
+
+def _run_posthoc_external_eval_best(
+    *,
+    run,
+    tracker: BestModelTracker,
+    ctx: Dict[str, Any],
+    model_name: str,
+    split_json: Optional[Path],
+    max_samples_per_bench: int,
+    output_dir: str,
+    hpo_trial: int,
+) -> Optional[Dict[str, Any]]:
+    best_ckpt = Path(tracker.output_dir) / "best_checkpoint.pt"
+    if not best_ckpt.is_file():
+        logger.warning(
+            "Skip post-hoc compositional external eval: missing %s",
+            best_ckpt,
+        )
+        return None
+
+    from experiments.eval_compositional_downstream import evaluate_checkpoint
+
+    catalogue_dir = Path(str(ctx["artifacts"].output_dir))
+    benches = list(ctx.get("benchmarks") or [])
+    effective_split_json = split_json
+    if effective_split_json is None:
+        try:
+            payload = torch.load(best_ckpt, map_location="cpu", weights_only=False)
+            split_qids = payload.get("split_qids") or {}
+            if isinstance(split_qids, dict) and split_qids:
+                split_out = Path(output_dir) / "best_external_eval_split.json"
+                split_payload: Dict[str, Any] = {
+                    "seed": None,
+                    "val_fraction": None,
+                    "train_test_holdout_count": 0,
+                    "benchmarks": {},
+                }
+                for bench, rows in split_qids.items():
+                    if not isinstance(rows, dict):
+                        continue
+                    train_q = sorted(int(x) for x in (rows.get("train") or []))
+                    val_q = sorted(int(x) for x in (rows.get("val") or []))
+                    test_q = sorted(int(x) for x in (rows.get("test") or []))
+                    split_payload["benchmarks"][bench] = {
+                        "n_total": len(set(train_q) | set(val_q) | set(test_q)),
+                        "train_question_ids": train_q,
+                        "val_question_ids": val_q,
+                        "test_question_ids": test_q,
+                    }
+                split_out.parent.mkdir(parents=True, exist_ok=True)
+                with open(split_out, "w") as f:
+                    json.dump(split_payload, f, indent=2)
+                effective_split_json = split_out
+        except Exception as e:
+            logger.warning(
+                "Could not derive split_json from best checkpoint; evaluating all observed rows: %s",
+                e,
+            )
+
+    eval_json = Path(output_dir) / "best_external_eval.json"
+    summary = evaluate_checkpoint(
+        catalogue_dir=catalogue_dir,
+        checkpoint_path=best_ckpt,
+        split_json=effective_split_json,
+        benchmarks=benches if benches else None,
+        model_name=model_name,
+        ft_adapter_path=None,
+        data_split="validation",
+        max_samples_per_bench=(
+            int(max_samples_per_bench) if int(max_samples_per_bench) > 0 else None
+        ),
+        output_json=eval_json,
+    )
+
+    u_pp = float(summary.get("unconditional_gain_pp", float("nan")))
+    n_eval = int(summary.get("n", 0))
+    payload: Dict[str, Any] = {
+        "hpo/mean_uplift_pp": u_pp,
+        "hpo/external_eval_n": float(n_eval),
+        "hpo/external_router_acc": float(summary.get("router_acc", float("nan"))),
+        "hpo/external_anchor_acc": float(summary.get("anchor_acc", float("nan"))),
+        "llm_eval/validation/unconditional_gain_pp": u_pp,
+        "llm_eval/validation/router_acc": float(summary.get("router_acc", float("nan"))),
+        "llm_eval/validation/anchor_acc": float(summary.get("anchor_acc", float("nan"))),
+        "llm_eval/validation/n_questions": float(n_eval),
+    }
+    for bench, row in (summary.get("per_bench") or {}).items():
+        if not isinstance(row, dict):
+            continue
+        payload[f"llm_eval/validation/{bench}/uplift_pp"] = float(
+            row.get("uplift_pp", float("nan"))
+        )
+        payload[f"llm_eval/validation/{bench}/n"] = float(row.get("n", 0))
+
+    # Keep charts aligned on hpo_trial axis; append as final point.
+    payload["hpo_trial"] = float(max(0, int(hpo_trial)))
+    run.log(payload)
+    logger.info(
+        "Post-hoc external eval logged: unconditional_gain_pp=%.4f n=%d",
+        u_pp,
+        n_eval,
+    )
+    return summary
+
+
 def run_optuna_optimization(
     *,
     router_kind: str = "fine",
@@ -83,6 +211,10 @@ def run_optuna_optimization(
     resume: bool = False,
     optuna_pruner: str = "none",
     optuna_intermediate_metric: str = "objective",
+    compositional_external_eval_mode: str = "auto",
+    compositional_external_eval_split_json: Optional[Path] = None,
+    compositional_external_eval_max_samples_per_bench: int = 0,
+    compositional_external_eval_model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
 ) -> ThresholdPriorArchive:
     """Run full-budget Optuna HPO using router-family abstraction."""
     if router_kind not in ROUTER_SPECS:
@@ -119,6 +251,7 @@ def run_optuna_optimization(
         run_config["scope"] = ctx.get("scope")
         run_config["benchmarks"] = ctx.get("benchmarks")
         run_config["objective_metric"] = ctx.get("objective_metric")
+        run_config["compositional_external_eval_mode"] = compositional_external_eval_mode
 
     run_tags = [benchmark, "unified-hpo", "optuna", router_kind]
     run = wandb.init(
@@ -328,6 +461,25 @@ def run_optuna_optimization(
             "Optuna backend skips SMAC ConfigSpace summary tables; "
             "use archive/study artifacts for sweep analysis."
         )
+    else:
+        if _should_run_posthoc_external_eval(
+            router_kind=router_kind,
+            mode=compositional_external_eval_mode,
+            ctx=ctx,
+        ):
+            try:
+                _run_posthoc_external_eval_best(
+                    run=run,
+                    tracker=tracker,
+                    ctx=ctx,
+                    model_name=compositional_external_eval_model_name,
+                    split_json=compositional_external_eval_split_json,
+                    max_samples_per_bench=compositional_external_eval_max_samples_per_bench,
+                    output_dir=output_dir,
+                    hpo_trial=len(archive),
+                )
+            except Exception as e:
+                logger.error("Post-hoc external eval failed: %s", e, exc_info=True)
 
     try:
         run.log(

@@ -113,6 +113,15 @@ class BestModelTracker:
 
         os.makedirs(self.output_dir, exist_ok=True)
 
+        best_payload_path: Optional[str] = None
+        compositional_payload = getattr(train_result, "compositional_payload", None)
+        if isinstance(compositional_payload, dict) and (
+            "model_state_dict" in compositional_payload
+            and "config" in compositional_payload
+        ):
+            best_payload_path = os.path.join(self.output_dir, "best_checkpoint.pt")
+            torch.save(compositional_payload, best_payload_path)
+
         # Save router weights
         torch.save(
             {
@@ -148,6 +157,7 @@ class BestModelTracker:
             "calibration_best_rho": calibration.best_rho,
             "calibration_best_threshold": calibration.best_threshold,
             "benchmark": self.benchmark,
+            "best_checkpoint": best_payload_path,
         }
         with open(os.path.join(self.output_dir, "meta.json"), "w") as f:
             json.dump(meta, f, indent=2, default=str)
@@ -585,7 +595,7 @@ def build_target_function(
                     use_dense_supervision=(
                         True if ctx.get("objective_metric", "mean_uplift") == "mean_uplift" else None
                     ),
-                    downstream_eval_every=0,
+                    downstream_eval_every=int(ctx.get("downstream_eval_every", 0)),
                     local_moebius_paths=ctx.get("local_moebius_paths") or None,
                     train_test_holdout_count=int(ctx.get("train_test_holdout_count", 0)),
                 )

@@ -183,7 +183,7 @@ class CompositionalRouterHpoSpec:
             wandb_prefix=str(ctx.get("hpo_wandb_prefix", "")),
             wandb_step_offset=int(ctx.get("hpo_wandb_step_offset", 0)),
             use_dense_supervision=True if objective_metric == "mean_uplift" else None,
-            downstream_eval_every=0,
+            downstream_eval_every=int(ctx.get("downstream_eval_every", 0)),
             local_moebius_paths=ctx.get("local_moebius_paths") or None,
             epoch_report_callback=_report_compositional_epoch,
             train_test_holdout_count=int(ctx.get("train_test_holdout_count", 0)),

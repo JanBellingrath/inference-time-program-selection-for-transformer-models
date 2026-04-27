@@ -615,6 +615,33 @@ def parse_args(default_backend: str = "smac"):
                         "trials in the sweep use the exact same split — matching the "
                         "one used by the catalogue-builder, so no validation Δ mass "
                         "leaks into the retained catalogue.")
+    p.add_argument(
+        "--compositional_downstream_eval_every",
+        type=int,
+        default=0,
+        help="(compositional) run dense downstream Δ (log-prob vs anchor, nats) every "
+             "N epochs inside train_one_router and log to W&B under downstream/*/ "
+             "(0 disables). Requires dense Δ matrices for mean_uplift supervision.",
+    )
+    p.add_argument(
+        "--compositional_external_eval_mode",
+        choices=["auto", "best_only", "off"],
+        default="auto",
+        help=(
+            "(compositional,optuna) automatic external LLM pp eval policy. "
+            "'auto' runs post-hoc on best checkpoint only when dense val supervision "
+            "is unavailable; 'best_only' always runs once at end; 'off' disables."
+        ),
+    )
+    p.add_argument(
+        "--compositional_external_eval_max_samples_per_bench",
+        type=int,
+        default=0,
+        help=(
+            "(compositional,optuna) cap validation questions per benchmark for "
+            "post-hoc external eval. 0 uses full validation split."
+        ),
+    )
     p.add_argument("--output_dir", type=str, default="hpo_results",
                    help="Output directory for HPO state, archive, and best models")
     p.add_argument("--wandb_project", type=str, default="unified-fine-routing-hpo")
@@ -789,6 +816,7 @@ def main(default_backend: str = "smac"):
             )
     else:
         data = _load_data_compositional(args)
+        data["downstream_eval_every"] = int(getattr(args, "compositional_downstream_eval_every", 0))
         # Compositional path: use the joined benchmarks string as the
         # tracker/logging "benchmark" identity.
         bench_label = (
@@ -835,6 +863,12 @@ def main(default_backend: str = "smac"):
                 resume=resume,
                 optuna_pruner=args.optuna_pruner,
                 optuna_intermediate_metric=args.optuna_intermediate_metric,
+                compositional_external_eval_mode=args.compositional_external_eval_mode,
+                compositional_external_eval_split_json=args.split_json,
+                compositional_external_eval_max_samples_per_bench=(
+                    args.compositional_external_eval_max_samples_per_bench
+                ),
+                compositional_external_eval_model_name=args.model_name,
             )
         if args.confirm_top_k > 0:
             logger.warning(

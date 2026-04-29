@@ -466,6 +466,29 @@ class UnaryScorer(nn.Module):
         return self.net(x).squeeze(-1)
 
 
+class DotProductScorer(nn.Module):
+    """Dot-product unary scorer ``u(q, o_j) = g_q · phi_j (+ b_j)``.
+
+    This matches the legacy compositional-router unary form used in older
+    checkpoints where primitive representations were consumed directly
+    without an edit-side MLP scorer.
+    """
+
+    def __init__(self, num_primitives: int, *, use_bias: bool = True):
+        super().__init__()
+        self.use_bias = bool(use_bias)
+        if self.use_bias:
+            self.bias = nn.Parameter(torch.zeros(num_primitives, dtype=torch.float32))
+        else:
+            self.bias = None
+
+    def forward(self, g_q: torch.Tensor, Phi: torch.Tensor) -> torch.Tensor:
+        out = g_q @ Phi.t()
+        if self.bias is not None:
+            out = out + self.bias
+        return out
+
+
 # ---------------------------------------------------------------------------
 # Question encoder
 # ---------------------------------------------------------------------------
@@ -756,7 +779,8 @@ class CompositionalRouter(nn.Module):
 
     Unary path (always present)::
 
-        u(q, o_j) = MLP_unary([z_q, phi_j])
+        u(q, o_j) = MLP_unary([z_q, phi_j])          # unary_scorer_type="mlp"
+        u(q, o_j) = z_q · phi_j (+ b_j)              # unary_scorer_type="dot"
 
     With ``use_pairs=True`` the router additionally learns a symmetric
     relational pair score ``v_q(o_i, o_j)`` over the catalogue's pair
@@ -783,6 +807,8 @@ class CompositionalRouter(nn.Module):
         edit_layer_norm_after: bool = False,
         unary_hidden_dims: Optional[Sequence[int]] = None,
         unary_dropout: float = 0.1,
+        unary_scorer_type: str = "mlp",
+        primitive_bias: bool = False,
         freeze_compressor: bool = False,
         use_pairs: bool = False,
         pair_hidden_dims: Sequence[int] = (96, 96),
@@ -800,6 +826,15 @@ class CompositionalRouter(nn.Module):
             dropout=dropout,
             freeze_compressor=freeze_compressor,
         )
+        self.unary_scorer_type = str(unary_scorer_type).strip().lower()
+        if self.unary_scorer_type not in {"mlp", "dot"}:
+            raise ValueError(
+                f"unknown unary_scorer_type={unary_scorer_type!r}; expected 'mlp' or 'dot'."
+            )
+        if primitive_bias and self.unary_scorer_type != "dot":
+            raise ValueError("primitive_bias is only supported when unary_scorer_type='dot'.")
+        self.primitive_bias_enabled = bool(primitive_bias and self.unary_scorer_type == "dot")
+
         self.phi_raw = PrimitiveEmbedding(
             primitives,
             d=d,
@@ -807,23 +842,30 @@ class CompositionalRouter(nn.Module):
             use_id_embedding=use_id_embedding,
             layer_norm_before=edit_layer_norm_before,
         )
-        if edit_hidden_dims is None:
-            edit_hidden_dims = (d, d)
-        self.phi_enc = PrimitiveEditEncoder(
-            d_in=d,
-            d_out=d,
-            hidden_dims=tuple(edit_hidden_dims),
-            dropout=edit_dropout,
-            layer_norm_after=edit_layer_norm_after,
-        )
-        if unary_hidden_dims is None:
-            unary_hidden_dims = (d, d)
-        self.unary_scorer = UnaryScorer(
-            d_z=d,
-            d_phi=d,
-            hidden_dims=tuple(unary_hidden_dims),
-            dropout=unary_dropout,
-        )
+        if self.unary_scorer_type == "mlp":
+            if edit_hidden_dims is None:
+                edit_hidden_dims = (d, d)
+            self.phi_enc: nn.Module = PrimitiveEditEncoder(
+                d_in=d,
+                d_out=d,
+                hidden_dims=tuple(edit_hidden_dims),
+                dropout=edit_dropout,
+                layer_norm_after=edit_layer_norm_after,
+            )
+            if unary_hidden_dims is None:
+                unary_hidden_dims = (d, d)
+            self.unary_scorer: nn.Module = UnaryScorer(
+                d_z=d,
+                d_phi=d,
+                hidden_dims=tuple(unary_hidden_dims),
+                dropout=unary_dropout,
+            )
+        else:
+            self.phi_enc = nn.Identity()
+            self.unary_scorer = DotProductScorer(
+                len(self._primitives_list),
+                use_bias=self.primitive_bias_enabled,
+            )
         self.d = d
         self.num_positions = num_positions
         self.use_pairs = bool(use_pairs)
@@ -921,7 +963,7 @@ class CompositionalRouter(nn.Module):
         return self.encoder(hidden_states, attention_mask)
 
     def primitive_scores_from_g(self, g_q: torch.Tensor) -> torch.Tensor:
-        """Return ``u_q ∈ [B, M]`` via the question--edit MLP."""
+        """Return ``u_q ∈ [B, M]`` via configured unary scorer."""
         return self.unary_scorer(g_q, self.phi())
 
     def primitive_scores(
@@ -1045,6 +1087,53 @@ class CompositionalRouter(nn.Module):
 # ---------------------------------------------------------------------------
 # Loss
 # ---------------------------------------------------------------------------
+
+
+def hard_ce_on_observed(
+    program_scores: torch.Tensor,
+    obs_indices: torch.Tensor,
+    obs_deltas: torch.Tensor,
+    obs_mask: torch.Tensor,
+    *,
+    student_temp: float = 1.0,
+) -> torch.Tensor:
+    """Hard cross-entropy on the observed candidate support.
+
+    Supervision is a one-hot target on the observed program with the largest
+    ``Δ_q(e_r)`` (ties broken by lowest observed position). Softmax is
+    computed over the observed-support logits only (padding masked out),
+    matching :func:`softmax_ce_on_observed` everywhere except the target
+    shape: a single "best-route" class instead of a tempered distribution
+    over all observed candidates.
+
+    Parameters
+    ----------
+    program_scores : ``[B, N]`` model scores over all legal programs.
+    obs_indices    : ``[B, K]`` long tensor; pad slots may carry any value.
+    obs_deltas     : ``[B, K]`` float tensor of observed deltas Δ_q(e_r).
+    obs_mask       : ``[B, K]`` 1.0 for real entries, 0.0 for padding.
+    student_temp   : divides model logits before ``log_softmax``.
+    """
+    if student_temp <= 0:
+        raise ValueError(f"student_temp must be > 0, got {student_temp}")
+
+    safe_indices = obs_indices.clamp(min=0)
+    gathered = program_scores.gather(1, safe_indices)        # [B, K]
+
+    very_neg = torch.finfo(gathered.dtype).min / 4
+    masked_logits = gathered.masked_fill(obs_mask <= 0, very_neg)
+    log_probs = F.log_softmax(masked_logits / float(student_temp), dim=-1)
+
+    masked_deltas = obs_deltas.masked_fill(obs_mask <= 0, very_neg)
+    target_pos = masked_deltas.argmax(dim=-1)                # [B]
+    # Drop rows that have zero real entries (no defined argmax target).
+    row_has_entry = (obs_mask.sum(dim=-1) > 0)
+    if not row_has_entry.any():
+        return program_scores.new_zeros(())
+    nll = -log_probs.gather(1, target_pos.unsqueeze(1)).squeeze(1)  # [B]
+    nll = nll * row_has_entry.to(nll.dtype)
+    denom = row_has_entry.to(nll.dtype).sum().clamp(min=1.0)
+    return nll.sum() / denom
 
 
 def softmax_ce_on_observed(
@@ -1503,6 +1592,7 @@ __all__ = [
     "CompositionalDataset",
     "collate_compositional",
     "softmax_ce_on_observed",
+    "hard_ce_on_observed",
     "local_moebius_loss",
     "program_scores_from_primitive_scores",
     "program_scores_with_pairs",

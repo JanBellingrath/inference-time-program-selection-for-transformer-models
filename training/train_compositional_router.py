@@ -351,7 +351,8 @@ def _downstream_metrics_on_split(
         empty.update({
             "router_acc": 0.0, "oracle_acc": 0.0, "anchor_acc": 0.0,
             "mean_uplift": 0.0, "oracle_uplift": 0.0, "frac_oracle": 0.0,
-            "best_fixed_acc": 0.0, "n_eval": 0.0,
+            "mean_uplift_pp": 0.0, "oracle_uplift_pp": 0.0,
+            "best_fixed_acc": 0.0, "best_fixed_uplift_pp": 0.0, "n_eval": 0.0,
         })
         return empty
     router.eval()
@@ -431,7 +432,8 @@ def _downstream_metrics_on_split(
         return {
             "router_acc": 0.0, "oracle_acc": 0.0, "anchor_acc": 0.0,
             "mean_uplift": 0.0, "oracle_uplift": 0.0, "frac_oracle": 0.0,
-            "best_fixed_acc": 0.0, "n_eval": 0.0,
+            "mean_uplift_pp": 0.0, "oracle_uplift_pp": 0.0,
+            "best_fixed_acc": 0.0, "best_fixed_uplift_pp": 0.0, "n_eval": 0.0,
             **{f"dense_top{k}_acc": 0.0 for k in ks},
         }
     router_acc = sum_router / n_total
@@ -462,8 +464,11 @@ def _downstream_metrics_on_split(
         "anchor_acc": anchor_acc,
         "mean_uplift": mean_uplift,
         "oracle_uplift": oracle_uplift,
+        "mean_uplift_pp": 100.0 * mean_uplift,
+        "oracle_uplift_pp": 100.0 * oracle_uplift,
         "frac_oracle": frac_oracle,
         "best_fixed_uplift": best_fixed_uplift,
+        "best_fixed_uplift_pp": 100.0 * best_fixed_uplift,
         "best_fixed_acc": anchor_acc + best_fixed_uplift,
         "n_eval": float(n_total),
     }
@@ -1458,6 +1463,18 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--val_fraction", type=float, default=0.15)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--split_json",
+        type=_Path,
+        default=None,
+        help="Optional train/val/test question ids (from scripts/make_canonical_split.py).",
+    )
+    p.add_argument(
+        "--train_test_holdout_count",
+        type=int,
+        default=0,
+        help="Only if --split_json omitted: test questions carved from train.",
+    )
 
     p.add_argument("--use_full_sequence", action="store_true",
                    help="Load full-sequence residuals (required by top_down_attention).")
@@ -1472,7 +1489,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--use_dense_supervision", action="store_true",
                    help="When dense deltas are loaded, supervise with full-N softmax CE.")
     p.add_argument("--downstream_eval_every", type=int, default=1,
-                   help="Run dense downstream eval every N epochs (0 disables).")
+                   help="Run dense downstream eval every N epochs (1 = each epoch; 0 disables).")
     p.add_argument("--downstream_eval_subset", type=int, default=0,
                    help="If >0, cap dense downstream eval to this many randomly "
                         "sampled questions per split (seed-pinned, stable across "
@@ -1664,6 +1681,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         checkpoint_metric=str(args.checkpoint_metric),
         use_anchor_bias=bool(args.use_anchor_bias),
         use_hard_ce=bool(args.hard_ce),
+        split_json_path=args.split_json,
+        train_test_holdout_count=int(args.train_test_holdout_count),
     )
 
     try:
@@ -1691,6 +1710,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
     finally:
         if wandb_run is not None:
+            try:
+                from training.auto_external_llm_eval import write_wandb_run_info
+
+                write_wandb_run_info(args.output_dir, wandb_run)
+            except Exception:
+                logger.warning("write_wandb_run_info failed.", exc_info=True)
             wandb_run.finish()
     return 0
 

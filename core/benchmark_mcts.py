@@ -747,14 +747,19 @@ class BenchmarkMCTS:
                    for s in samples]
 
         orig_pad = wrapper.tokenizer.padding_side
-        wrapper.tokenizer.padding_side = "left"
+        # Right padding + per-row last non-pad index is robust for
+        # mixed prompt lengths in batched 1-token MC evaluation.
+        wrapper.tokenizer.padding_side = "right"
         inputs = wrapper.tokenizer(
             prompts, return_tensors="pt", padding=True, truncation=True,
         ).to(wrapper.model.device)
         wrapper.tokenizer.padding_side = orig_pad
 
         logits = self._forward(layers, inputs.input_ids, inputs.attention_mask)
-        last_logits = logits[:, -1, :]
+        # Select each sample's own final non-pad position (not a shared -1).
+        last_pos = inputs.attention_mask.sum(dim=1) - 1
+        row_idx = torch.arange(logits.shape[0], device=logits.device)
+        last_logits = logits[row_idx, last_pos, :]
         next_tokens = last_logits.argmax(dim=-1)
 
         results: List[Tuple[int, int, int]] = []
@@ -1283,12 +1288,12 @@ class BenchmarkMCTS:
 
         Args:
             default_seq: Anchor sequence for the search root.  When None, the
-                identity ``[0..n-1]`` order is used.  When set (e.g. the
-                pre-FT best sequence in ``search_ft_search`` phase 3), the
-                MCTS tree starts at that sequence and ``max_swaps`` counts
-                deviations from it; the same sequence is also used as the
-                comparison baseline for tier-2/3/4 deltas and for the
-                ``default_seq`` exclusion in noisy-better filtering.
+                identity ``[0..n-1]`` order is used.  ``search_ft_search``
+                phase 3 passes the pre-FT best / FT training order so baselines
+                and the tree root match the adapted module path.  When set,
+                ``max_swaps`` counts deviations from that anchor; the same
+                sequence is the comparison baseline for tier-2/3/4 and for
+                noisy-better filtering.
         """
         n = self.model.num_layers
         if default_seq is None:

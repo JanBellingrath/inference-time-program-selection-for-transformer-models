@@ -13,7 +13,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -101,6 +101,7 @@ def _train_router_model(
     weight_decay: float,
     epochs: int,
     device: torch.device,
+    epoch_val_callback: Optional[Callable[[int, float], None]] = None,
 ) -> Tuple[FineRouter, float]:
     """Train router for ``epochs``; keep weights with best val loss.  Returns (model, best_val_loss)."""
     optimizer = torch.optim.AdamW(router.parameters(), lr=lr, weight_decay=weight_decay)
@@ -126,6 +127,8 @@ def _train_router_model(
                 val_loss += loss_fn(router(x), y_b).item() * x.size(0)
         val_loss /= max(val_size, 1)
         scheduler.step()
+        if epoch_val_callback is not None:
+            epoch_val_callback(epoch, float(val_loss))
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -361,6 +364,7 @@ def train_and_summarize(
     gate_epochs: int = DEFAULT_GATE_EPOCHS,
     batch_size: int = DEFAULT_BATCH_SIZE,
     val_fraction: float = 0.15,
+    router_epoch_val_callback: Optional[Callable[[int, float], None]] = None,
 ) -> TrainResult:
     """Train router (and gate/delta-gate if needed) for one HPO configuration.
 
@@ -473,6 +477,7 @@ def train_and_summarize(
     router, router_val_loss = _train_router_model(
         router, train_loader, val_loader, val_size,
         loss_fn, router_lr, router_wd, router_epochs, device,
+        epoch_val_callback=router_epoch_val_callback,
     )
     result.router = router
     result.router_val_loss = router_val_loss

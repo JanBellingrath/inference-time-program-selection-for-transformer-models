@@ -45,6 +45,11 @@ class FineRoutingConfig:
 
     # ---- per-question MCTS search (alternative to exhaustive enumeration) ----
     use_mcts: bool = False
+    # Root sequence for ``per_question_mcts`` / :class:`BenchNode` budgets:
+    # ``"default"`` → ``[0, 1, ..., L-1]`` (same template for every benchmark);
+    # ``"benchmark_mcts"`` → load per-benchmark optimal sequence from
+    # ``results_dir`` (legacy / benchmark-tuned anchor).
+    mcts_anchor_source: str = "default"
     mcts_num_simulations: int = 64
     mcts_exploration_constant: float = 1.8
     mcts_pw_C: float = 1.0

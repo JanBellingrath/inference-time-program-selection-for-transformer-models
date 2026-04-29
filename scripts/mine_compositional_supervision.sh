@@ -56,6 +56,8 @@
 #       [--results_dir predictions/<...>]         # MCTS snapshot dir for anchor lookup (Stage 0)
 #       [--max_questions N]                       # cap per split (debug)
 #       [--min_count 50] [--min_questions 50]     # compositional primitive-support filters
+#       [--keep_kinds skip repeat swap assign]    # forwarded to build_compositional_catalogues
+#                                                 # (env KEEP_KINDS also; default: skip repeat swap)
 #       [--include_local_moebius]                 # also run Mobius pipeline (Stage G)
 #       [--include_pairs]                         # pair Mobius targets too
 #       [--no_resume]                             # nuke existing dense state
@@ -67,7 +69,9 @@
 #       [--mcts_num_simulations 250]
 #       [--max_local_edits 2] [--swap_radius 3]
 #       [--editable_start 17] [--pivot_layer 16]
-#       [--identity_anchor]                       # use identity anchor if no MCTS snapshot exists
+#       [--mcts_anchor_source default|benchmark_mcts]  # default=[0..L-1]; legacy=load snapshots
+#       [--identity_anchor]                     # alias for --mcts_anchor_source default
+#       [--benchmark_mcts_anchor]               # alias for --mcts_anchor_source benchmark_mcts
 #
 # Background / supervisor mode
 # ----------------------------
@@ -83,21 +87,22 @@ cd "$ROOT"
 
 # ---------------------------- defaults ---------------------------------------
 BENCH="hellaswag"
-MCTS_DIR=""
-OUTPUT_ROOT=""
+MCTS_DIR="${MCTS_DIR:-}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-}"
 MODEL_NAME="Qwen/Qwen2.5-0.5B-Instruct"
 SPLITS="train validation"
 MCTS_SPLIT="train"
-DR_LLM_DIR="/home/janerik/generalized_transformer-2/dr-llm"
-BATCH_SIZE=8
-GPU=0
-SAVE_INTERVAL=50
+DR_LLM_DIR="${DR_LLM_DIR:-/home/janerik/generalized_transformer-2/dr-llm}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
+GPU="${GPU:-0}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-50}"
 ADAPTER_PATH=""
 RESULTS_DIR="predictions/qwen25_0.5b_v2_sdpa"
 MAX_QUESTIONS=""
 SCORE_MODE="continuous"
 MIN_COUNT=50
 MIN_QUESTIONS=50
+KEEP_KINDS="${KEEP_KINDS:-skip repeat swap}"
 INCLUDE_MOEBIUS=0
 INCLUDE_PAIRS=0
 NO_RESUME=0
@@ -110,7 +115,7 @@ MAX_LOCAL_EDITS=2
 SWAP_RADIUS=3
 EDITABLE_START=17
 PIVOT_LAYER=16
-IDENTITY_ANCHOR=0
+MCTS_ANCHOR_SOURCE="${MCTS_ANCHOR_SOURCE:-default}"
 
 # ---------------------------- arg parsing ------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -131,6 +136,14 @@ while [[ $# -gt 0 ]]; do
     --score_mode)            SCORE_MODE="$2"; shift 2 ;;
     --min_count)             MIN_COUNT="$2"; shift 2 ;;
     --min_questions)         MIN_QUESTIONS="$2"; shift 2 ;;
+    --keep_kinds)
+      shift
+      KEEP_KINDS=""
+      while [[ $# -gt 0 && $1 != -* ]]; do
+        KEEP_KINDS="$KEEP_KINDS${KEEP_KINDS:+ }$1"
+        shift
+      done
+      ;;
     --include_local_moebius) INCLUDE_MOEBIUS=1; shift ;;
     --include_pairs)         INCLUDE_PAIRS=1; shift ;;
     --no_resume)             NO_RESUME=1; shift ;;
@@ -141,13 +154,20 @@ while [[ $# -gt 0 ]]; do
     --swap_radius)           SWAP_RADIUS="$2"; shift 2 ;;
     --editable_start)        EDITABLE_START="$2"; shift 2 ;;
     --pivot_layer)           PIVOT_LAYER="$2"; shift 2 ;;
-    --identity_anchor)       IDENTITY_ANCHOR=1; shift ;;
+    --mcts_anchor_source)    MCTS_ANCHOR_SOURCE="$2"; shift 2 ;;
+    --identity_anchor)       MCTS_ANCHOR_SOURCE="default"; shift ;;
+    --benchmark_mcts_anchor) MCTS_ANCHOR_SOURCE="benchmark_mcts"; shift ;;
     -h|--help)
       sed -n '2,60p' "$0"
       exit 0 ;;
     *) echo "Unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+
+MAX_Q_FLAG=()
+if [[ -n "$MAX_QUESTIONS" ]]; then
+  MAX_Q_FLAG=( --max_questions "$MAX_QUESTIONS" )
+fi
 
 # ---------------------------- defaults that depend on $BENCH -----------------
 if [[ -z "$OUTPUT_ROOT" ]]; then
@@ -203,8 +223,9 @@ log "DR_LLM_DIR=$DR_LLM_DIR"
 log "BATCH_SIZE=$BATCH_SIZE  GPU=$GPU  SAVE_INTERVAL=$SAVE_INTERVAL"
 log "ADAPTER_PATH=${ADAPTER_PATH:-<none>}  RESULTS_DIR=$RESULTS_DIR"
 log "MIN_COUNT=$MIN_COUNT  MIN_QUESTIONS=$MIN_QUESTIONS"
+log "KEEP_KINDS=$KEEP_KINDS"
 log "INCLUDE_MOEBIUS=$INCLUDE_MOEBIUS  INCLUDE_PAIRS=$INCLUDE_PAIRS  NO_RESUME=$NO_RESUME"
-log "MCTS: SKIP=$SKIP_MCTS FORCE=$FORCE_MCTS sims=$MCTS_NUM_SIMULATIONS K=$MAX_LOCAL_EDITS R=$SWAP_RADIUS S=$EDITABLE_START pivot=$PIVOT_LAYER identity_anchor=$IDENTITY_ANCHOR"
+log "MCTS: SKIP=$SKIP_MCTS FORCE=$FORCE_MCTS sims=$MCTS_NUM_SIMULATIONS K=$MAX_LOCAL_EDITS R=$SWAP_RADIUS S=$EDITABLE_START pivot=$PIVOT_LAYER mcts_anchor_source=$MCTS_ANCHOR_SOURCE"
 log "LOG=$LOG"
 
 run_until_ok() {
@@ -246,23 +267,17 @@ fi
 if [[ "$NEED_MCTS" -eq 1 ]]; then
   MCTS_DIR="$LOCAL_MCTS_DIR"
   mkdir -p "$MCTS_DIR"
-  IDENTITY_FLAG=()
-  if [[ "$IDENTITY_ANCHOR" -eq 1 ]]; then
-    IDENTITY_FLAG=( --identity_anchor_benchmarks "$BENCH" )
-  fi
-  ADAPTER_FLAG_MCTS=()
-  # build_fine_routing_dataset.py does not currently take --adapter_path, so we
-  # don't forward ADAPTER_PATH here. If you need an FT-adapter MCTS run, use
-  # build_ft_fine_routing_dataset.py manually and point --mcts_dir at it.
   log "Stage 0: build_fine_routing_dataset.py --use_mcts (output=$MCTS_DIR)"
   run_until_ok "build_mcts_${BENCH}" \
-    bash -lc "cd '$DR_LLM_DIR' && python data_prep/build_fine_routing_dataset.py \
+    bash -lc "cd '$ROOT' && python -m data_prep.build_fine_routing_dataset \
       --model_name '$MODEL_NAME' \
       --results_dir '$RESULTS_DIR' \
       --benchmarks '$BENCH' \
       --output_dir '$MCTS_DIR' \
       --data_split '$MCTS_SPLIT' \
       --use_mcts \
+      --use_continuous_scoring \
+      --mcts_anchor_source '$MCTS_ANCHOR_SOURCE' \
       --mcts_num_simulations '$MCTS_NUM_SIMULATIONS' \
       --max_local_edits '$MAX_LOCAL_EDITS' \
       --swap_radius '$SWAP_RADIUS' \
@@ -270,7 +285,7 @@ if [[ "$NEED_MCTS" -eq 1 ]]; then
       --pivot_layer '$PIVOT_LAYER' \
       --gpu_rank '$GPU' \
       --resume \
-      ${IDENTITY_FLAG[*]:-}"
+      ${MAX_Q_FLAG[*]:-}"
 else
   log "[skip] Stage 0: MCTS jsonl already present at ${MCTS_DIR}/${BENCH}.jsonl"
 fi
@@ -278,6 +293,12 @@ fi
 if [[ ! -f "${MCTS_DIR}/${BENCH}.jsonl" ]]; then
   log "FATAL: still missing ${MCTS_DIR}/${BENCH}.jsonl after Stage 0; aborting."
   exit 2
+fi
+
+# Align canonical DSL with compositional primitive kinds (assign lives in canonical rows when enabled).
+CANON_ASSIGN_FLAG=()
+if [[ " $KEEP_KINDS " != *" assign "* ]]; then
+  CANON_ASSIGN_FLAG=( --no-include_assign )
 fi
 
 # ----------------------------------------------------------------------------
@@ -292,7 +313,8 @@ else
       --data_dir "$MCTS_DIR" \
       --output_dir "$CANON_DIR" \
       --benchmarks "$BENCH" \
-      --copy-residuals
+      --copy-residuals \
+      "${CANON_ASSIGN_FLAG[@]}"
 fi
 
 # ----------------------------------------------------------------------------
@@ -321,7 +343,8 @@ else
       --output_dir "$COMP_DIR" \
       --benchmarks "$BENCH" \
       --min_count "$MIN_COUNT" \
-      --min_questions "$MIN_QUESTIONS"
+      --min_questions "$MIN_QUESTIONS" \
+      --keep_kinds $KEEP_KINDS
 fi
 
 # ----------------------------------------------------------------------------
@@ -349,11 +372,6 @@ ADAPTER_FLAG=()
 if [[ -n "$ADAPTER_PATH" ]]; then
   ADAPTER_FLAG=( --adapter_path "$ADAPTER_PATH" )
 fi
-MAX_Q_FLAG=()
-if [[ -n "$MAX_QUESTIONS" ]]; then
-  MAX_Q_FLAG=( --max_questions "$MAX_QUESTIONS" )
-fi
-
 for SPLIT in $SPLITS; do
   SPLIT_OUT="${DENSE_ROOT}/${SPLIT}"
   mkdir -p "$SPLIT_OUT"

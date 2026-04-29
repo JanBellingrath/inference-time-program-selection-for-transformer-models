@@ -1,7 +1,7 @@
-"""Unified SMAC + Hyperband (training fidelity) hyperparameter search.
+"""Unified HPO stack (SMAC or Optuna) for routing systems.
 
-Hyperband ``budget`` scales router/gate **training epochs** only. Open-rate
-calibration and proxy gain always use the **full** routing-val split.
+SMAC path keeps Hyperband-style training budgets. Optuna path runs full-budget
+trials first and reuses the same training/evaluation internals via router specs.
 
 This package searches the full routed decision pipeline: gating strategy, target
 construction, loss family, router and gate architectures, and training policy.

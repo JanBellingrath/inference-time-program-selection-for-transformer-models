@@ -64,3 +64,13 @@ eval_results/
 figures/
 plots/
 assets/
+
+# Local experiment artifacts (do not commit)
+compositional_runs/
+router_runs/
+runs/
+catalogs/
+smac3_output/
+hpo_results/
+tmp_bmcts*.json
+tmp_bmcts*.jsonl

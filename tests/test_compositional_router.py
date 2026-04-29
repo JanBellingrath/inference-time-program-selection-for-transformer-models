@@ -60,6 +60,7 @@ def _toy_artifacts():
             K=1,
             editable_indices=tuple(range(len(TOY_ANCHOR))),
             swap_radius=TOY_GEOMETRY["swap_radius"],
+            include_assign=TOY_GEOMETRY["include_assign"],
         )
         if len(prog) == 1
     ]
@@ -359,6 +360,22 @@ def test_unary_scorer_is_mlp_not_dot_product():
     assert u_mlp.shape == u_dot.shape
     diff = (u_mlp - u_dot).abs().max().item()
     assert diff > 1e-3, "unary scorer collapsed to a dot product"
+
+
+def test_dot_unary_scorer_matches_closed_form():
+    """Legacy dot scorer path computes ``g @ Phi.T (+ b)`` exactly."""
+    router, _primitives, _catalogue, d_model = _toy_router(
+        unary_scorer_type="dot",
+        primitive_bias=True,
+    )
+    router.eval()
+    torch.manual_seed(21)
+    x = torch.randn(3, d_model)
+    g_q = router.encode(x)
+    Phi = router.phi()
+    u_dot = router.primitive_scores_from_g(g_q)
+    expected = g_q @ Phi.t() + router.unary_scorer.bias
+    torch.testing.assert_close(u_dot, expected, rtol=1e-6, atol=1e-6)
 
 
 def test_pair_scorer_uses_post_mlp_phi():

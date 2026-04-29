@@ -227,6 +227,8 @@ def train_and_score_compositional(
         edit_layer_norm_after=bool(config.get("edit_layer_norm_after", False)),
         unary_hidden_dims=unary_hidden_dims,
         unary_dropout=float(config.get("unary_dropout", 0.1)),
+        unary_scorer_type=str(config.get("unary_scorer_type", "mlp")),
+        primitive_bias=bool(config.get("primitive_bias", False)),
         lam=float(config.get("lam", 0.0)),
         tau=float(config.get("tau", 1.0)),
         student_temp=float(config.get("student_temperature", 1.0)),

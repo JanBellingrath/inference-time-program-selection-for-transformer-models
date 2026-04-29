@@ -15,6 +15,7 @@ catalogue and a per-benchmark dense Δ matrix
   (gold = per-question best Δ row)
 * per-edit-length stratified breakdown
 * a "router pick" column for downstream inspection
+* full per-route pick counts (``route_pick_counts`` / ``route_pick_histogram``)
 
 Everything runs batched on the chosen device and shares the same
 ``LegalCatalogue``/encoder code paths used by training.
@@ -39,7 +40,7 @@ _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
 import argparse
 import json
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -49,13 +50,180 @@ from routers.compositional_router import (
     CompositionalDataset,
     CompositionalRouter,
     LegalCatalogue,
+    PairwiseScorer,
+    PrimitiveEmbedding,
+    QuestionEncoder,
     build_compressor,
-    CompressorConfig,
+    compute_pair_relation_features,
     load_artifacts,
+    program_scores_with_pairs,
+    CompressorConfig,
+    N_RELATION_FEATURES,
 )
 from routers.residual_compressors import pad_sequences
 
 logger = logging.getLogger("evaluate_compositional_router")
+
+RouterModule = Union[CompositionalRouter, "LegacyDotProductCompositionalRouter"]
+
+
+# ---------------------------------------------------------------------------
+# Legacy checkpoints (phi.* + dot-product unary + bias, no phi_enc / unary MLP)
+# ---------------------------------------------------------------------------
+
+
+class LegacyDotProductCompositionalRouter(torch.nn.Module):
+    """Loads pre-refactor checkpoints where ``Phi = LayerNorm(E_symb)`` and
+    ``u_q = g_q Phi^T + b`` (per-primitive bias)."""
+
+    def __init__(
+        self,
+        primitives: Sequence[Any],
+        compressor: torch.nn.Module,
+        cfg: Dict[str, Any],
+    ) -> None:
+        super().__init__()
+        d = int(cfg["d_latent"])
+        num_positions = int(cfg["num_positions"])
+        self._primitives_list = list(primitives)
+        self.phi_raw = PrimitiveEmbedding(
+            primitives,
+            d=d,
+            num_positions=num_positions,
+            use_id_embedding=bool(cfg.get("use_id_embedding", False)),
+            layer_norm_before=bool(cfg.get("primitive_layer_norm", True)),
+        )
+        self.encoder = QuestionEncoder(
+            compressor,
+            d=d,
+            hidden_dims=cfg.get("encoder_hidden_dims", []),
+            dropout=cfg.get("encoder_dropout", 0.1),
+            freeze_compressor=bool(cfg.get("freeze_compressor", False)),
+        )
+        self.use_pairs = bool(cfg.get("use_pairs", False))
+        self.primitive_bias = torch.nn.Parameter(
+            torch.zeros(len(self._primitives_list), dtype=torch.float32),
+        )
+        ph = cfg.get("pair_hidden_dims", (96, 96))
+        if isinstance(ph, list):
+            ph = tuple(int(x) for x in ph)
+        else:
+            ph = tuple(int(x) for x in ph)
+        if self.use_pairs:
+            self.pair_scorer: Optional[PairwiseScorer] = PairwiseScorer(
+                d_z=d,
+                d_phi=d,
+                d_r=N_RELATION_FEATURES,
+                hidden_dims=ph,
+                dropout=float(cfg.get("pair_dropout", 0.1)),
+                zero_init_last=bool(cfg.get("pair_zero_init", True)),
+            )
+        else:
+            self.pair_scorer = None
+        self.pair_topk_primitives: Optional[int] = None
+
+        M = len(self._primitives_list)
+        if M >= 2:
+            all_pairs = torch.tensor(
+                [(i, j) for i in range(M) for j in range(i + 1, M)],
+                dtype=torch.long,
+            )
+            rel_all = compute_pair_relation_features(
+                self._primitives_list, all_pairs,
+                num_positions=num_positions,
+            ).float()
+            flat_to_row = torch.full((M * M,), -1, dtype=torch.long)
+            for r, (i, j) in enumerate(all_pairs.tolist()):
+                flat_to_row[i * M + j] = r
+                flat_to_row[j * M + i] = r
+        else:
+            rel_all = torch.zeros(0, N_RELATION_FEATURES, dtype=torch.float32)
+            flat_to_row = torch.zeros(max(1, M * M), dtype=torch.long)
+        self.register_buffer("_cached_rel_features", rel_all, persistent=False)
+        self.register_buffer("_rel_flat_to_row", flat_to_row, persistent=False)
+
+    def relation_features_for_pairs(
+        self,
+        i_idx: torch.Tensor,
+        j_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        if i_idx.numel() == 0:
+            return self._cached_rel_features.new_zeros(0, N_RELATION_FEATURES)
+        M = len(self._primitives_list)
+        flat = i_idx.long() * M + j_idx.long()
+        rows = self._rel_flat_to_row.index_select(0, flat.view(-1))
+        return self._cached_rel_features.index_select(0, rows).view(
+            *flat.shape, N_RELATION_FEATURES,
+        )
+
+    def encode(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.encoder(hidden_states, attention_mask)
+
+    def primitive_scores_from_g(self, g_q: torch.Tensor) -> torch.Tensor:
+        Phi = self.phi_raw()
+        return (g_q @ Phi.T) + self.primitive_bias
+
+    def pair_scores_from_g(
+        self,
+        g_q: torch.Tensor,
+        catalogue: LegalCatalogue,
+    ) -> Optional[torch.Tensor]:
+        if self.pair_scorer is None or not catalogue.has_pairs:
+            return None
+        rel = catalogue.relation_features
+        if rel is None:
+            raise RuntimeError(
+                "catalogue.relation_features missing; call attach_pair_features() first."
+            )
+        Phi = self.phi_raw()
+        return self.pair_scorer(g_q, Phi, catalogue.pair_index, rel)
+
+    def program_scores(
+        self,
+        u_q: torch.Tensor,
+        catalogue: LegalCatalogue,
+        lam: float,
+        v_q: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return program_scores_with_pairs(
+            u_q, v_q, catalogue.A, catalogue.B, catalogue.lengths, lam,
+        )
+
+    def attach_pair_features(self, catalogues: Iterable[LegalCatalogue]) -> None:
+        for cat in catalogues:
+            if not cat.has_pairs or cat.relation_features is not None:
+                continue
+            pair_index = cat.pair_index.to(self._rel_flat_to_row.device)
+            rel = self.relation_features_for_pairs(
+                pair_index[:, 0], pair_index[:, 1],
+            )
+            cat.relation_features = rel.to(cat.A.device)
+
+
+def _map_legacy_state_dict(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    mapped: Dict[str, torch.Tensor] = {}
+    for k, v in state.items():
+        if k.startswith("phi."):
+            rest = k[len("phi.") :]
+            if rest.startswith("norm."):
+                rest = "norm_before." + rest[len("norm.") :]
+            mapped["phi_raw." + rest] = v
+        elif k == "bias":
+            mapped["primitive_bias"] = v
+        else:
+            mapped[k] = v
+    return mapped
+
+
+def _is_legacy_compositional_state(state: Dict[str, torch.Tensor]) -> bool:
+    keys = list(state.keys())
+    return any(k.startswith("phi.") for k in keys) and not any(
+        k.startswith("phi_raw.") for k in keys
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +248,7 @@ def load_router_from_checkpoint(
     checkpoint_path: _Path,
     artifacts: CompositionalArtifacts,
     device: torch.device,
-) -> Tuple[CompositionalRouter, Dict[str, Any], List[str], Dict[str, int]]:
+) -> Tuple[RouterModule, Dict[str, Any], List[str], Dict[str, int], Dict[str, Any]]:
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     cfg = payload["config"]
     benchmarks = payload["benchmarks"]
@@ -99,6 +267,16 @@ def load_router_from_checkpoint(
     d_model = int(sample.shape[-1])
 
     compressor = _build_compressor(d_model, cfg)
+    state = payload["model_state_dict"]
+    if _is_legacy_compositional_state(state):
+        router = LegacyDotProductCompositionalRouter(
+            artifacts.primitives, compressor, cfg,
+        ).to(device)
+        router.load_state_dict(_map_legacy_state_dict(state))
+        router.eval()
+        logger.info("Loaded legacy compositional checkpoint (dot-product unary, phi.* weights).")
+        return router, cfg, benchmarks, bench_to_id, payload
+
     d_latent = int(cfg["d_latent"])
     router = CompositionalRouter(
         primitives=artifacts.primitives,
@@ -114,6 +292,8 @@ def load_router_from_checkpoint(
         edit_layer_norm_after=cfg.get("edit_layer_norm_after", False),
         unary_hidden_dims=cfg.get("unary_hidden_dims", [d_latent, d_latent]),
         unary_dropout=cfg.get("unary_dropout", 0.1),
+        unary_scorer_type=cfg.get("unary_scorer_type", "mlp"),
+        primitive_bias=cfg.get("primitive_bias", False),
         freeze_compressor=cfg.get("freeze_compressor", False),
         use_pairs=cfg.get("use_pairs", False),
         pair_hidden_dims=cfg.get("pair_hidden_dims", (96, 96)),
@@ -122,7 +302,7 @@ def load_router_from_checkpoint(
         pair_topk_primitives=cfg.get("pair_topk_primitives"),
         use_anchor_bias=cfg.get("use_anchor_bias", False),
     ).to(device)
-    router.load_state_dict(payload["model_state_dict"])
+    router.load_state_dict(state)
     router.eval()
     return router, cfg, benchmarks, bench_to_id, payload
 
@@ -226,7 +406,7 @@ def _select_indices(
 
 @torch.no_grad()
 def _score_indices(
-    router: CompositionalRouter,
+    router: RouterModule,
     dataset: CompositionalDataset,
     indices: Sequence[int],
     catalogue: LegalCatalogue,
@@ -357,8 +537,21 @@ def evaluate(
     frac_pred_anchor = float((pred_lengths == 0).float().mean().item())
     n_unique_picks = int(torch.unique(pred).numel())
 
-    # router pick distribution top-5
+    # router pick distribution (full histogram + legacy top-5 summary)
     bincount = torch.bincount(pred, minlength=N).float()
+    counts_i = [int(bincount[i].item()) for i in range(N)]
+    order = sorted(range(N), key=lambda i: counts_i[i], reverse=True)
+    route_pick_histogram = [
+        {
+            "route_idx": i,
+            "n_picked": counts_i[i],
+            "frac_picked": float(counts_i[i] / Q),
+            "fixed_route_mean_delta": float(fixed_route_mean_delta[i].item()),
+            "length": int(catalogue.lengths[i].item()),
+        }
+        for i in order
+        if counts_i[i] > 0
+    ]
     top_routes = torch.topk(bincount, k=min(5, N))
     top_routes_list = [
         {
@@ -389,6 +582,8 @@ def evaluate(
         # router behaviour
         "frac_router_picks_anchor": frac_pred_anchor,
         "n_unique_router_picks": n_unique_picks,
+        "route_pick_counts": counts_i,
+        "route_pick_histogram": route_pick_histogram,
         "top_router_picks": top_routes_list,
         # by edit length
         "by_pred_length": _length_stratified(delta_router, pred_lengths),

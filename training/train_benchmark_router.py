@@ -838,6 +838,7 @@ def evaluate_routing_full_pass(
         wrapper.model.model.layer_indices = layers
         try:
             has_dup = len(layers) != len(set(layers))
+            non_default_order = list(layers) != list(range(mcts_model.num_layers))
             prompt = wrapper.prepare_prompt(text, system_prompt=system_prompt)
             inputs = wrapper.tokenizer(prompt, return_tensors="pt").to(
                 wrapper.model.device
@@ -848,7 +849,7 @@ def evaluate_routing_full_pass(
                 "pad_token_id": wrapper.tokenizer.eos_token_id,
                 "do_sample": False,
             }
-            if has_dup:
+            if has_dup or non_default_order:
                 gen_kw["use_cache"] = False
             out = wrapper.model.generate(**inputs, **gen_kw)
             return wrapper.tokenizer.decode(
@@ -1075,6 +1076,7 @@ class BenchmarkRouterConfig:
     exclude_benchmarks: Optional[List[str]] = None
     mcts_seed: Optional[int] = None
     mcts_n_used: Optional[int] = None
+    auto_external_llm_eval: bool = True
 
 
 def run_eval_only(cfg: BenchmarkRouterConfig):
@@ -1409,6 +1411,12 @@ def train(cfg: BenchmarkRouterConfig):
             wb_config["bias_val_acc"] = bias_val_acc  # type: ignore[possibly-undefined]
         wandb.init(project=cfg.wandb_project, config=wb_config)
         wandb.watch(router, log="gradients", log_freq=50)
+        try:
+            from training.auto_external_llm_eval import write_wandb_run_info
+
+            write_wandb_run_info(cfg.output_dir, wandb.run)
+        except Exception:
+            logger.warning("write_wandb_run_info failed.", exc_info=True)
 
     # --- Full-pass model (loaded once, reused across epochs) ---
     mcts_model = None
@@ -1539,6 +1547,46 @@ def train(cfg: BenchmarkRouterConfig):
             router, val_loader, device, cfg.benchmarks, optimal_sequences,
         )
 
+    if use_wandb and cfg.auto_external_llm_eval:
+        best_path = os.path.join(cfg.output_dir, "checkpoint_best.pt")
+        if not os.path.isfile(best_path):
+            logger.warning("Auto external LLM eval skipped: missing %s", best_path)
+        else:
+            try:
+                ck_best = torch.load(best_path, map_location="cpu", weights_only=False)
+                router.load_state_dict(ck_best["router_state_dict"])
+                fp_model = mcts_model
+                if fp_model is None:
+                    from core.permutation_mcts import MCTSModel
+
+                    logger.info("Loading %s for post-train LLM eval...", cfg.model_name)
+                    fp_model = MCTSModel(cfg.model_name, rank=0)
+                exclude_b = list(cfg.exclude_benchmarks or [])
+                eval_benches = [b for b in cfg.benchmarks if b not in exclude_b]
+                samples_pb = None if cfg.full_pass_samples == -1 else cfg.full_pass_samples
+                from training.auto_external_llm_eval import run_benchmark_router_full_pass_and_log
+
+                run_benchmark_router_full_pass_and_log(
+                    wandb.run,
+                    evaluate_full_pass_fn=evaluate_routing_full_pass,
+                    router=router,
+                    val_ds=val_ds,
+                    device=device,
+                    benchmark_names=cfg.benchmarks,
+                    optimal_sequences={b: optimal_sequences.get(b) for b in cfg.benchmarks},
+                    mcts_model=fp_model,
+                    model_name=cfg.model_name,
+                    samples_per_bench=samples_pb,
+                    sample_seed=cfg.full_pass_sample_seed,
+                    bias_model=frozen_bias,
+                    debias_alpha=cfg.debias_alpha,
+                    sample_benchmarks=eval_benches,
+                    mcts_seed=cfg.mcts_seed,
+                    mcts_n_used=cfg.mcts_n_used,
+                )
+            except Exception:
+                logger.exception("Benchmark-router post-train LLM eval failed.")
+
     if use_wandb:
         wandb.finish()
 
@@ -1632,6 +1680,12 @@ def main():
                         help="MCTS shuffle seed — used to reconstruct seen samples for leak-free MMLU eval")
     parser.add_argument("--mcts_n_used", type=int, default=None,
                         help="Number of samples the MCTS search consumed from the shuffled pool")
+    parser.add_argument(
+        "--auto_external_llm_eval",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="After training, run full-pass LLM eval on best checkpoint and log llm_eval/* to W&B.",
+    )
     args = parser.parse_args()
 
     # Flatten comma-separated benchmarks: --benchmarks a,b c -> [a, b, c]
@@ -1687,6 +1741,7 @@ def main():
         exclude_benchmarks=args.exclude_benchmarks,
         mcts_seed=args.mcts_seed,
         mcts_n_used=args.mcts_n_used,
+        auto_external_llm_eval=bool(args.auto_external_llm_eval),
     )
     if cfg.eval_only:
         run_eval_only(cfg)

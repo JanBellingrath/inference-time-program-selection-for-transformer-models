@@ -153,6 +153,8 @@ def _load_compositional_router(
         edit_layer_norm_after=cfg.get("edit_layer_norm_after", False),
         unary_hidden_dims=cfg.get("unary_hidden_dims", [d_latent, d_latent]),
         unary_dropout=cfg.get("unary_dropout", 0.1),
+        unary_scorer_type=cfg.get("unary_scorer_type", "mlp"),
+        primitive_bias=cfg.get("primitive_bias", False),
         freeze_compressor=cfg.get("freeze_compressor", False),
         use_pairs=cfg.get("use_pairs", False),
         pair_hidden_dims=cfg.get("pair_hidden_dims", (96, 96)),

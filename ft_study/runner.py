@@ -428,8 +428,9 @@ def run_search_for_study(
         notify_signal: Forward to ``BenchmarkMCTS`` for Signal notifications.
         anchor_seq: Optional anchor for the MCTS root.  When provided, the
             tree is anchored at this sequence and tier-2/3/4 baselines are
-            measured for it (instead of the identity order).  Used by
-            ``search_ft_search`` phase 3 to pass the pre-FT best sequence.
+            measured for it (instead of the identity order).  Omitted for
+            most arms (identity baseline).  ``search_ft_search`` phase 3 passes
+            ``pre_ft_seq`` — the same order used for fine-tuning.
         val_select_samples: When non-empty AND a working evaluation model is
             supplied, the top-``rerank_topk`` MCTS candidates are re-evaluated
             on this held-out pool (TALE-style 1-token grading) and the one
@@ -440,8 +441,8 @@ def run_search_for_study(
             For post-FT search, pass the loaded FT model (e.g.
             ``ft_mcts.wrapper.model``).
         eval_tokenizer_for_rerank: Matching tokenizer.
-        extra_rerank_candidates: Additional sequences to inject into the
-            rerank candidate pool (e.g. the pre-FT sequence in phase 3).
+        extra_rerank_candidates: Optional extra sequences for val_select rerank
+            (e.g. ``pre_ft_seq`` in ``search_ft_search`` phase 3).
 
     Returns ``(best_seq, summary)``.  If the post-MCTS rerank picks a
     different sequence than the tier-best, ``summary["rerank"]`` will hold
@@ -1134,10 +1135,9 @@ def _run_search_ft_search(
         del peft_model
         torch.cuda.empty_cache()
 
-    # -- Phase 3: re-search on fine-tuned model, ANCHORED at pre_ft_seq --
-    # The FT adapter was trained with the model running ``pre_ft_seq`` order,
-    # so the only fair baseline for the post-FT MCTS is the FT model under
-    # the SAME pre_ft_seq order, not the identity sequence.
+    # -- Phase 3: re-search on FT model, MCTS anchored at the training order --
+    # Adapter was fit with ``pre_ft_seq``; tier baselines and the search root use
+    # that same order (not identity), so deviations are measured from the FT module path.
     pre_ft_active = seq_to_layers(pre_ft_seq)
     ft_mcts = _MCTSModelFromLoaded.from_pretrained_ft(
         model_name, train_result.adapter_dir, layer_sequence=pre_ft_active,
@@ -1697,7 +1697,19 @@ def main():
         "--verify_only", action="store_true",
         help="Only run the LoRA-layer-reorder sanity check, then exit",
     )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Use Hugging Face local cache only: sets HF_HUB_OFFLINE, "
+        "TRANSFORMERS_OFFLINE, and HF_DATASETS_OFFLINE (no Hub/DNS needed).",
+    )
     args = parser.parse_args()
+
+    if args.offline:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ["HF_DATASETS_OFFLINE"] = "1"
+        os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
     logging.basicConfig(
         level=logging.INFO,

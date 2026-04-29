@@ -76,6 +76,7 @@ def generate_under_layers(
     wrapper.model.model.layer_indices = layers
     try:
         has_dup = len(layers) != len(set(layers))
+        non_default_order = list(layers) != list(range(wrapper.num_layers))
         prompt = wrapper.prepare_prompt(text, system_prompt=system_prompt)
         inputs = wrapper.tokenizer(prompt, return_tensors="pt").to(wrapper.model.device)
         input_len = inputs.input_ids.shape[1]
@@ -84,7 +85,7 @@ def generate_under_layers(
             "pad_token_id": wrapper.tokenizer.eos_token_id,
             "do_sample": False,
         }
-        if has_dup or is_math or len(layers) != wrapper.num_layers:
+        if has_dup or is_math or len(layers) != wrapper.num_layers or non_default_order:
             gen_kw["use_cache"] = False
         with torch.no_grad():
             out = wrapper.model.generate(**inputs, **gen_kw)

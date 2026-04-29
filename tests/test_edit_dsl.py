@@ -119,7 +119,9 @@ def test_disjoint_primitives_commute(seed: int):
 
 def test_enumeration_is_shortest_first_lex():
     A = _identity_anchor(8)
-    progs = list(enumerate_admissible_programs(A, K=3, swap_radius=2))
+    progs = list(
+        enumerate_admissible_programs(A, K=3, swap_radius=2, include_assign=False)
+    )
     assert progs[0] == ()
     keys = [(len(e), program_key(e)) for e in progs]
     assert keys == sorted(keys), "enumeration must be shortest-first lex"
@@ -127,7 +129,9 @@ def test_enumeration_is_shortest_first_lex():
 
 def test_admissibility_disjoint_supports_and_no_noops():
     A = _identity_anchor(8)
-    for prog in enumerate_admissible_programs(A, K=3, swap_radius=2):
+    for prog in enumerate_admissible_programs(
+        A, K=3, swap_radius=2, include_assign=False
+    ):
         used: set = set()
         cur = list(A)
         prev_key = None
@@ -149,15 +153,19 @@ def test_admissibility_disjoint_supports_and_no_noops():
 def test_canonicalize_idempotent_on_admissible_image():
     A = _identity_anchor(8)
     clear_canonical_cache()
-    progs = list(enumerate_admissible_programs(A, K=3, swap_radius=2))
-    table = build_canonical_map(A, K=3, swap_radius=2)
+    progs = list(
+        enumerate_admissible_programs(A, K=3, swap_radius=2, include_assign=False)
+    )
+    table = build_canonical_map(
+        A, K=3, swap_radius=2, include_assign=False
+    )
     seen_routes = set()
     for e in progs:
         r = tuple(apply_program(A, e))
         if r in seen_routes:
             continue
         seen_routes.add(r)
-        c = canonicalize(A, list(r), K=3, swap_radius=2)
+        c = canonicalize(A, list(r), K=3, swap_radius=2, include_assign=False)
         assert c is not None
         assert c == table[r]
         # canonical program executes back to r
@@ -171,8 +179,8 @@ def test_canonicalize_invariant_under_edit_order():
     r1 = apply_program(A, e1)
     r2 = apply_program(A, e2)
     assert r1 == r2
-    c1 = canonicalize(A, r1, K=2, swap_radius=2)
-    c2 = canonicalize(A, r2, K=2, swap_radius=2)
+    c1 = canonicalize(A, r1, K=2, swap_radius=2, include_assign=False)
+    c2 = canonicalize(A, r2, K=2, swap_radius=2, include_assign=False)
     assert c1 == c2
     assert canonical_key_str(c1) == "skip(2)+swap(4,5)"
 
@@ -183,7 +191,9 @@ def test_canonicalize_returns_none_for_unreachable_route():
     A = _identity_anchor(8)
     bad = list(A)
     bad[3] = 99  # value not in [0..7], can't be produced by anchor-relative ops
-    assert canonicalize(A, bad, K=3, swap_radius=2) is None
+    assert (
+        canonicalize(A, bad, K=3, swap_radius=2, include_assign=False) is None
+    )
 
 
 def test_canonicalize_shortest_first_picks_minimal_length():
@@ -191,7 +201,7 @@ def test_canonicalize_shortest_first_picks_minimal_length():
     # equivalent exists (e.g. swap(i,j) vs. some long-cycle composition).
     A = _identity_anchor(6)
     r = apply_program(A, (skip(2),))
-    c = canonicalize(A, r, K=3, swap_radius=2)
+    c = canonicalize(A, r, K=3, swap_radius=2, include_assign=False)
     assert c == (skip(2),)
     assert len(c) == 1
 

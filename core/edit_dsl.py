@@ -235,6 +235,10 @@ def enumerate_primitive_instances(
 ) -> List[Primitive]:
     """Build the catalogue ``O = O_skip u O_rep u O_swap`` (spec 1.2).
 
+    ``include_assign`` defaults to False here because an ``anchor`` is required
+    to enumerate assign candidates; for assign-aware program sets use
+    :func:`enumerate_admissible_programs` (default ``include_assign=True``).
+
     Yielded in ``prim_key`` order so downstream enumeration is deterministic.
 
     Parameters
@@ -323,7 +327,7 @@ def enumerate_admissible_programs(
     K: int,
     editable_indices: Optional[Iterable[int]] = None,
     swap_radius: int = 2,
-    include_assign: bool = False,
+    include_assign: bool = True,
     dedupe_assign_with_struct: bool = False,
 ) -> Iterator[Program]:
     """Yield all admissible programs in increasing length, lex order within length.
@@ -401,7 +405,7 @@ def build_canonical_map(
     K: int,
     editable_indices: Optional[Iterable[int]] = None,
     swap_radius: int = 2,
-    include_assign: bool = False,
+    include_assign: bool = True,
     dedupe_assign_with_struct: bool = False,
 ) -> Dict[Tuple[int, ...], Program]:
     """Materialize the full ``route_key -> C(route)`` table for one anchor.
@@ -432,7 +436,7 @@ def canonicalize(
     K: int,
     editable_indices: Optional[Iterable[int]] = None,
     swap_radius: int = 2,
-    include_assign: bool = False,
+    include_assign: bool = True,
     dedupe_assign_with_struct: bool = False,
 ) -> Optional[Program]:
     """Return ``C(r)`` for ``r = target_route``, or ``None`` if unreachable.
@@ -469,7 +473,7 @@ def canonicalize_cached(
     K: int,
     editable_indices: Optional[Iterable[int]] = None,
     swap_radius: int = 2,
-    include_assign: bool = False,
+    include_assign: bool = True,
     dedupe_assign_with_struct: bool = False,
 ) -> Optional[Program]:
     """Like ``canonicalize`` but reuses an LRU-cached canonical map per anchor."""

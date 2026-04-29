@@ -40,6 +40,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, random_split
 
+try:
+    import wandb
+
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
+    wandb = None  # type: ignore
+
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
@@ -1204,6 +1212,20 @@ def train_compressed_router(
 # CLI
 # ---------------------------------------------------------------------------
 
+
+def _fine_eval_benchmark_names(args: argparse.Namespace) -> Optional[List[str]]:
+    """Benchmarks that have both gate and router checkpoints under output_dir."""
+    if args.benchmarks:
+        return list(args.benchmarks)
+    out = _Path(args.output_dir)
+    names: List[str] = []
+    for g in sorted(out.glob("gate_best_*.pt")):
+        b = g.stem.replace("gate_best_", "", 1)
+        if (out / f"router_best_{b}.pt").is_file():
+            names.append(b)
+    return names or None
+
+
 def main():
     p = argparse.ArgumentParser(description="Train per-benchmark fine routers")
     p.add_argument("--data_dir", type=str, required=True)
@@ -1294,25 +1316,117 @@ def main():
     p.add_argument("--compressor_d_compress", type=int, default=256)
     p.add_argument("--compressor_n_heads", type=int, default=4)
     p.add_argument("--compressor_n_latent", type=int, default=1)
+    p.add_argument("--wandb", action="store_true", help="Log to Weights & Biases.")
+    p.add_argument("--wandb_project", type=str, default="fine-router")
+    p.add_argument("--wandb_run_name", type=str, default=None)
+    p.add_argument(
+        "--auto_external_llm_eval",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="After training, run experiments.run_fine_routing_inference (needs gates + --external_eval_results_dir).",
+    )
+    p.add_argument(
+        "--external_eval_results_dir",
+        type=str,
+        default=None,
+        help="MCTS results dir for anchor sequences (required for auto external eval).",
+    )
+    p.add_argument(
+        "--external_eval_model_name",
+        type=str,
+        default="Qwen/Qwen2.5-0.5B-Instruct",
+    )
+    p.add_argument("--inference_gamma", type=float, default=0.8)
+    p.add_argument("--external_eval_gpu_rank", type=int, default=0)
     args = p.parse_args()
 
-    if args.label_mode == "enumerated":
-        benchmarks = args.benchmarks
-        if benchmarks is None:
-            benchmarks = RouterDataset._discover_benchmarks(args.data_dir)
-        comp_cfg = CompressorConfig(
-            compressor_type="last_token",
-            d_model=896,
-            d_compress=args.compressor_d_compress,
-            n_heads=args.compressor_n_heads,
-            n_latent_tokens=args.compressor_n_latent,
-        )
-        for bench in benchmarks:
-            train_compressed_router(
+    wb_run = None
+    if args.wandb:
+        if not HAS_WANDB:
+            logger.warning("wandb requested but not installed; skipping W&B.")
+        else:
+            wb_run = wandb.init(project=args.wandb_project, name=args.wandb_run_name)
+            try:
+                from training.auto_external_llm_eval import write_wandb_run_info
+
+                write_wandb_run_info(args.output_dir, wb_run)
+            except Exception:
+                logger.exception("write_wandb_run_info failed.")
+
+    try:
+        if args.label_mode == "enumerated":
+            benchmarks = args.benchmarks
+            if benchmarks is None:
+                benchmarks = RouterDataset._discover_benchmarks(args.data_dir)
+            comp_cfg = CompressorConfig(
+                compressor_type="last_token",
+                d_model=896,
+                d_compress=args.compressor_d_compress,
+                n_heads=args.compressor_n_heads,
+                n_latent_tokens=args.compressor_n_latent,
+            )
+            for bench in benchmarks:
+                train_compressed_router(
+                    data_dir=args.data_dir,
+                    output_dir=args.output_dir,
+                    benchmark=bench,
+                    compressor_cfg=comp_cfg,
+                    gate_positives_only=args.gate_positives_only,
+                    hidden_dims=args.hidden_dims,
+                    dropout=args.dropout,
+                    lr=args.lr,
+                    epochs=args.epochs,
+                    batch_size=args.batch_size,
+                    val_fraction=args.val_fraction,
+                    seed=args.seed,
+                    model_is_finetuned=args.model_is_finetuned,
+                    mcts_catalog_mode=args.mcts_catalog_mode,
+                    label_mode="enumerated",
+                    swap_radius=args.enum_swap_radius,
+                    editable_start=args.enum_editable_start,
+                    max_local_edits=args.enum_max_local_edits,
+                    exclude_noop=args.exclude_noop,
+                    train_gate=args.train_gate,
+                    gate_hidden_dim=args.gate_hidden_dim,
+                    gate_dropout=args.gate_dropout,
+                    gate_lr=args.gate_lr,
+                    gate_epochs=args.gate_epochs,
+                    recall_boost=args.recall_boost,
+                    gate_gamma=args.gate_gamma,
+                )
+        elif args.compressor_type != "last_token":
+            comp_cfg = CompressorConfig(
+                compressor_type=args.compressor_type,
+                d_compress=args.compressor_d_compress,
+                n_heads=args.compressor_n_heads,
+                n_latent_tokens=args.compressor_n_latent,
+            )
+            benchmarks = args.benchmarks
+            if benchmarks is None:
+                benchmarks = RouterDataset._discover_benchmarks(args.data_dir)
+            for bench in benchmarks:
+                train_compressed_router(
+                    data_dir=args.data_dir,
+                    output_dir=args.output_dir,
+                    benchmark=bench,
+                    compressor_cfg=comp_cfg,
+                    gate_positives_only=args.gate_positives_only,
+                    hidden_dims=args.hidden_dims,
+                    dropout=args.dropout,
+                    lr=args.lr,
+                    epochs=args.epochs,
+                    batch_size=args.batch_size,
+                    val_fraction=args.val_fraction,
+                    seed=args.seed,
+                    model_is_finetuned=args.model_is_finetuned,
+                    mcts_catalog_mode=args.mcts_catalog_mode,
+                    label_mode="auto",
+                )
+        else:
+            train_all_routers(
                 data_dir=args.data_dir,
                 output_dir=args.output_dir,
-                benchmark=bench,
-                compressor_cfg=comp_cfg,
+                benchmarks=args.benchmarks,
                 gate_positives_only=args.gate_positives_only,
                 hidden_dims=args.hidden_dims,
                 dropout=args.dropout,
@@ -1323,63 +1437,47 @@ def main():
                 seed=args.seed,
                 model_is_finetuned=args.model_is_finetuned,
                 mcts_catalog_mode=args.mcts_catalog_mode,
-                label_mode="enumerated",
-                swap_radius=args.enum_swap_radius,
-                editable_start=args.enum_editable_start,
-                max_local_edits=args.enum_max_local_edits,
-                exclude_noop=args.exclude_noop,
-                train_gate=args.train_gate,
-                gate_hidden_dim=args.gate_hidden_dim,
-                gate_dropout=args.gate_dropout,
-                gate_lr=args.gate_lr,
-                gate_epochs=args.gate_epochs,
-                recall_boost=args.recall_boost,
-                gate_gamma=args.gate_gamma,
             )
-    elif args.compressor_type != "last_token":
-        comp_cfg = CompressorConfig(
-            compressor_type=args.compressor_type,
-            d_compress=args.compressor_d_compress,
-            n_heads=args.compressor_n_heads,
-            n_latent_tokens=args.compressor_n_latent,
-        )
-        benchmarks = args.benchmarks
-        if benchmarks is None:
-            benchmarks = RouterDataset._discover_benchmarks(args.data_dir)
-        for bench in benchmarks:
-            train_compressed_router(
-                data_dir=args.data_dir,
-                output_dir=args.output_dir,
-                benchmark=bench,
-                compressor_cfg=comp_cfg,
-                gate_positives_only=args.gate_positives_only,
-                hidden_dims=args.hidden_dims,
-                dropout=args.dropout,
-                lr=args.lr,
-                epochs=args.epochs,
-                batch_size=args.batch_size,
-                val_fraction=args.val_fraction,
-                seed=args.seed,
-                model_is_finetuned=args.model_is_finetuned,
-                mcts_catalog_mode=args.mcts_catalog_mode,
-                label_mode="auto",
-            )
-    else:
-        train_all_routers(
-            data_dir=args.data_dir,
-            output_dir=args.output_dir,
-            benchmarks=args.benchmarks,
-            gate_positives_only=args.gate_positives_only,
-            hidden_dims=args.hidden_dims,
-            dropout=args.dropout,
-            lr=args.lr,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            val_fraction=args.val_fraction,
-            seed=args.seed,
-            model_is_finetuned=args.model_is_finetuned,
-            mcts_catalog_mode=args.mcts_catalog_mode,
-        )
+
+        if wb_run is not None and args.auto_external_llm_eval:
+            gates = list(_Path(args.output_dir).glob("gate_best_*.pt"))
+            if not gates:
+                logger.warning(
+                    "Skipping fine-router external LLM eval: no gate_best_*.pt in %s",
+                    args.output_dir,
+                )
+            elif not args.external_eval_results_dir:
+                logger.warning(
+                    "Skipping fine-router external LLM eval: set --external_eval_results_dir.",
+                )
+            else:
+                bnames = _fine_eval_benchmark_names(args)
+                if not bnames:
+                    logger.warning(
+                        "Skipping fine-router external LLM eval: no paired gate/router checkpoints.",
+                    )
+                else:
+                    try:
+                        from training.auto_external_llm_eval import (
+                            run_fine_router_external_infer_subprocess_and_log,
+                        )
+
+                        out_json = _Path(args.output_dir) / "external_eval_fine_llm.json"
+                        run_fine_router_external_infer_subprocess_and_log(
+                            wb_run,
+                            checkpoint_dir=args.output_dir,
+                            results_dir=args.external_eval_results_dir,
+                            benchmarks=bnames,
+                            output_json=out_json,
+                            model_name=args.external_eval_model_name,
+                            inference_gamma=float(args.inference_gamma),
+                            gpu_rank=int(args.external_eval_gpu_rank),
+                        )
+                    except Exception:
+                        logger.exception("Fine-router external LLM eval failed.")
+    finally:
+        if wb_run is not None:
+            wandb.finish()
 
 
 if __name__ == "__main__":

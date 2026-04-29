@@ -31,6 +31,7 @@ _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
 import argparse
 import json
 import logging
+import math
 import os
 from collections import defaultdict
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
@@ -333,26 +334,28 @@ def _downstream_metrics_on_split(
     *,
     ks: Sequence[int] = (1, 3, 5),
 ) -> Dict[str, float]:
-    """Downstream MC-accuracy metrics from the dense Δ matrix.
+    """Dense Δ metrics (training supervision space, often log-prob nats).
 
-    For each question with a loaded dense Δ vector we compute:
+    ``router_acc`` / ``oracle_acc`` / ``anchor_acc`` are means of
+    ``anchor_utility + Δ(...)`` using the **continuous** ``delta_matrix`` —
+    not necessarily 0/1 MC accuracy unless that matrix stores probabilities.
 
-    * ``router_acc``    -- mean of ``anchor_acc + Δ[argmax_S_q]``
-    * ``oracle_acc``    -- mean of ``anchor_acc + max_r Δ_q(r)``
-    * ``anchor_acc``    -- mean of stored ``anchor_utility``
-    * ``mean_uplift``   -- ``router_acc − anchor_acc``
-    * ``oracle_uplift`` -- ``oracle_acc − anchor_acc``
-    * ``frac_oracle``   -- ``mean_uplift / oracle_uplift`` (0 if oracle 0)
-    * ``best_fixed_acc``-- best mean across all routes (fixed-route baseline)
-    * ``dense_top{k}``  -- top-k accuracy where gold = argmax_r Δ_q(r)
+    When the dataset dense payload includes ``delta_matrix_binary`` and
+    ``anchor_accuracies`` (see ``merge_dense_increment``), we also report true
+    binary task rates and ``*_acc_pp`` (percentage points vs anchor).
+
+    * ``dense_top{k}`` — top-k vs gold = argmax_r Δ_q(r) on the **continuous** mat.
     """
     if not indices:
         empty = {f"dense_top{k}_acc": 0.0 for k in ks}
         empty.update({
             "router_acc": 0.0, "oracle_acc": 0.0, "anchor_acc": 0.0,
             "mean_uplift": 0.0, "oracle_uplift": 0.0, "frac_oracle": 0.0,
-            "mean_uplift_pp": 0.0, "oracle_uplift_pp": 0.0,
-            "best_fixed_acc": 0.0, "best_fixed_uplift_pp": 0.0, "n_eval": 0.0,
+            "best_fixed_acc": 0.0, "best_fixed_uplift": 0.0,
+            "router_acc_binary": float("nan"), "oracle_acc_binary": float("nan"),
+            "anchor_acc_binary": float("nan"), "mean_uplift_acc_pp": float("nan"),
+            "oracle_uplift_acc_pp": float("nan"), "best_fixed_uplift_acc_pp": float("nan"),
+            "n_eval_binary": 0.0, "n_eval": 0.0,
         })
         return empty
     router.eval()
@@ -364,12 +367,17 @@ def _downstream_metrics_on_split(
     sum_oracle = 0.0
     sum_anchor = 0.0
     n_total = 0
+    sum_router_bin = 0.0
+    sum_oracle_bin = 0.0
+    sum_anchor_bin = 0.0
+    n_total_bin = 0
     hits = {k: 0 for k in ks}
     # For best-fixed-route baseline we need per-route mean utility across
     # the eval set, accumulated over all benchmarks present.
     fixed_route_sums: Dict[int, torch.Tensor] = {}
     fixed_route_count: Dict[int, int] = {}
     max_k = max(ks)
+    fixed_route_sums_bin: Dict[int, torch.Tensor] = {}
 
     for bid, bench_indices in by_bench.items():
         catalogue = bench_id_to_catalogue[bid]
@@ -382,12 +390,17 @@ def _downstream_metrics_on_split(
             continue
         dense_mat = dataset.dense_deltas_per_bench.get(bench_name)
         anchor_util = dataset.anchor_utilities_per_bench.get(bench_name)
+        dense_bin = dataset.dense_deltas_binary_per_bench.get(bench_name)
+        anchor_acc_bin = dataset.anchor_accuracies_per_bench.get(bench_name)
         if dense_mat is None or anchor_util is None:
             continue
+        use_bin = dense_bin is not None and anchor_acc_bin is not None
         N_b = int(catalogue.n_programs)
         if bid not in fixed_route_sums:
             fixed_route_sums[bid] = torch.zeros(N_b, dtype=torch.float64)
             fixed_route_count[bid] = 0
+        if use_bin and bid not in fixed_route_sums_bin:
+            fixed_route_sums_bin[bid] = torch.zeros(N_b, dtype=torch.float64)
         # batched encode
         BATCH = 64
         for start in range(0, len(bench_indices), BATCH):
@@ -418,6 +431,22 @@ def _downstream_metrics_on_split(
             sum_oracle += float((anchor_chunk + d_best).sum().item())
             sum_anchor += float(anchor_chunk.sum().item())
             n_total += int(preds.numel())
+            if use_bin:
+                db_chunk = torch.stack(
+                    [dense_bin[dataset.question_ids[i]] for i in chunk], dim=0,
+                ).to(device)
+                ab_chunk = torch.tensor(
+                    [float(anchor_acc_bin[dataset.question_ids[i]].item()) for i in chunk],
+                    device=device,
+                )
+                total_b = ab_chunk.unsqueeze(1) + db_chunk
+                r_router_b = ab_chunk + db_chunk.gather(1, preds.unsqueeze(1)).squeeze(1)
+                r_oracle_b, _ = total_b.max(dim=-1)
+                sum_router_bin += float(r_router_b.sum().item())
+                sum_oracle_bin += float(r_oracle_b.sum().item())
+                sum_anchor_bin += float(ab_chunk.sum().item())
+                n_total_bin += int(preds.numel())
+                fixed_route_sums_bin[bid] += db_chunk.detach().cpu().double().sum(dim=0)
             # top-k against dense gold
             kk = min(max_k, S_q.shape[1])
             topk = torch.topk(S_q, k=kk, dim=-1).indices  # [B, kk]
@@ -432,8 +461,11 @@ def _downstream_metrics_on_split(
         return {
             "router_acc": 0.0, "oracle_acc": 0.0, "anchor_acc": 0.0,
             "mean_uplift": 0.0, "oracle_uplift": 0.0, "frac_oracle": 0.0,
-            "mean_uplift_pp": 0.0, "oracle_uplift_pp": 0.0,
-            "best_fixed_acc": 0.0, "best_fixed_uplift_pp": 0.0, "n_eval": 0.0,
+            "best_fixed_acc": 0.0, "best_fixed_uplift": 0.0,
+            "router_acc_binary": float("nan"), "oracle_acc_binary": float("nan"),
+            "anchor_acc_binary": float("nan"), "mean_uplift_acc_pp": float("nan"),
+            "oracle_uplift_acc_pp": float("nan"), "best_fixed_uplift_acc_pp": float("nan"),
+            "n_eval_binary": 0.0, "n_eval": 0.0,
             **{f"dense_top{k}_acc": 0.0 for k in ks},
         }
     router_acc = sum_router / n_total
@@ -444,6 +476,7 @@ def _downstream_metrics_on_split(
     frac_oracle = mean_uplift / oracle_uplift if oracle_uplift > 1e-9 else 0.0
     # best-fixed-route across the eval set
     best_fixed_uplift = 0.0
+    best_fixed_uplift_bin = float("nan")
     if fixed_route_sums:
         # weighted mean per benchmark, then take per-bench best (single benchmark
         # in the typical single-scope case gives the obvious answer).
@@ -458,19 +491,50 @@ def _downstream_metrics_on_split(
         if per_bench_best:
             tot = sum(per_bench_n)
             best_fixed_uplift = sum(b * n for b, n in zip(per_bench_best, per_bench_n)) / tot
+    if fixed_route_sums_bin and n_total_bin > 0:
+        per_bb = []
+        per_nn = []
+        for bid, sums_b in fixed_route_sums_bin.items():
+            nc = fixed_route_count.get(bid, 0)
+            if nc == 0:
+                continue
+            mean_b = sums_b / float(nc)
+            per_bb.append(float(mean_b.max().item()))
+            per_nn.append(nc)
+        if per_bb:
+            totb = sum(per_nn)
+            best_fixed_uplift_bin = sum(b * n for b, n in zip(per_bb, per_nn)) / totb
+
+    router_acc_bin = sum_router_bin / n_total_bin if n_total_bin else float("nan")
+    oracle_acc_bin = sum_oracle_bin / n_total_bin if n_total_bin else float("nan")
+    anchor_acc_bin = sum_anchor_bin / n_total_bin if n_total_bin else float("nan")
+    mean_uplift_bin = (
+        router_acc_bin - anchor_acc_bin if n_total_bin > 0 else float("nan")
+    )
+    oracle_uplift_bin = (
+        oracle_acc_bin - anchor_acc_bin if n_total_bin > 0 else float("nan")
+    )
+
     out = {
         "router_acc": router_acc,
         "oracle_acc": oracle_acc,
         "anchor_acc": anchor_acc,
         "mean_uplift": mean_uplift,
         "oracle_uplift": oracle_uplift,
-        "mean_uplift_pp": 100.0 * mean_uplift,
-        "oracle_uplift_pp": 100.0 * oracle_uplift,
         "frac_oracle": frac_oracle,
         "best_fixed_uplift": best_fixed_uplift,
-        "best_fixed_uplift_pp": 100.0 * best_fixed_uplift,
         "best_fixed_acc": anchor_acc + best_fixed_uplift,
         "n_eval": float(n_total),
+        "router_acc_binary": router_acc_bin,
+        "oracle_acc_binary": oracle_acc_bin,
+        "anchor_acc_binary": anchor_acc_bin,
+        "mean_uplift_acc_pp": 100.0 * mean_uplift_bin,
+        "oracle_uplift_acc_pp": 100.0 * oracle_uplift_bin,
+        "best_fixed_uplift_acc_pp": (
+            100.0 * best_fixed_uplift_bin
+            if not math.isnan(best_fixed_uplift_bin) else float("nan")
+        ),
+        "n_eval_binary": float(n_total_bin),
     }
     for k in ks:
         out[f"dense_top{k}_acc"] = hits[k] / n_total

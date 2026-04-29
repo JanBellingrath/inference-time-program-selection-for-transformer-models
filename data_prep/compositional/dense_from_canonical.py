@@ -7,6 +7,12 @@ replace this with a true exhaustive re-evaluation.
 
 Outputs a torch file with ``delta_matrix`` ``[Q, N]`` and ``anchor_utilities``
 ``[Q]`` (noop / anchor score when available).
+
+Optional sidecars ``delta_matrix_binary`` and ``anchor_accuracies`` (same
+shapes) are **not** produced here; they appear when merging or mining dense
+eval artifacts that record binary / TALE correctness (see
+``data_prep/merge_dense_increment``). The training downstream hook uses them
+for real ``*_acc_pp`` metrics.
 """
 
 from __future__ import annotations

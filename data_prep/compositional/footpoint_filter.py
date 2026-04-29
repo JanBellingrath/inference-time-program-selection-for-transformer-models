@@ -210,6 +210,9 @@ def filter_joint_bundle(
         dm = payload["delta_matrix"].float()
         new_dm = dm[:, old_cols].clone()
         payload["delta_matrix"] = new_dm
+        if "delta_matrix_binary" in payload:
+            dmb = payload["delta_matrix_binary"].float()
+            payload["delta_matrix_binary"] = dmb[:, old_cols].clone()
         payload["n_programs"] = int(new_dm.shape[1])
         if "catalogue" in payload and isinstance(payload["catalogue"], dict):
             payload["catalogue"]["n_programs"] = int(new_dm.shape[1])

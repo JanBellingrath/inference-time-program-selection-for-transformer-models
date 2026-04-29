@@ -178,13 +178,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     col_idx = torch.tensor(order_full, dtype=torch.long)
     dm_sub = dm.index_select(1, col_idx).contiguous()
     au = raw["anchor_utilities"].float()
+    payload_out: Dict[str, Any] = {
+        "delta_matrix": dm_sub,
+        "anchor_utilities": au,
+        "n_programs": int(K),
+        "catalogue": "marginal_greedy",
+    }
+    dmb_o = raw.get("delta_matrix_binary")
+    aa_o = raw.get("anchor_accuracies")
+    if (dmb_o is not None) ^ (aa_o is not None):
+        raise SystemExit(
+            "dense_matrix_pt must include both delta_matrix_binary and anchor_accuracies "
+            "or neither"
+        )
+    if dmb_o is not None:
+        dmb = dmb_o.float()
+        aa_bin = aa_o.float()
+        if dmb.shape != dm.shape:
+            raise SystemExit(
+                f"delta_matrix_binary shape {tuple(dmb.shape)} != delta_matrix {tuple(dm.shape)}"
+            )
+        if aa_bin.shape != au.shape:
+            raise SystemExit(
+                f"anchor_accuracies shape {tuple(aa_bin.shape)} != anchor_utilities {tuple(au.shape)}"
+            )
+        payload_out["delta_matrix_binary"] = dmb.index_select(1, col_idx).contiguous()
+        payload_out["anchor_accuracies"] = aa_bin
     torch.save(
-        {
-            "delta_matrix": dm_sub,
-            "anchor_utilities": au,
-            "n_programs": int(K),
-            "catalogue": "marginal_greedy",
-        },
+        payload_out,
         out / "dense_deltas" / f"{bench}.pt",
     )
 

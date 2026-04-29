@@ -25,7 +25,10 @@ benchmark is then re-expressed against this joint row space:
   with ``obs_indices`` remapped to joint rows.
 * ``dense_deltas/{b}.pt``         — optional; per-benchmark ``Δ`` matrices
   remapped to joint columns (columns that were not in ``b``'s original
-  catalogue are zero-filled and will be masked).
+  catalogue are zero-filled and will be masked). When the input dense file
+  contains ``delta_matrix_binary`` / ``anchor_accuracies`` (from
+  ``dr-llm/data_prep/dense_reevaluation.py``), those tensors are remapped and
+  saved alongside the continuous supervision.
 * ``dense_masks/{b}.pt``          — ``keep_mask[N_joint]`` = 1.0 where
   joint row was measurable on benchmark ``b`` (i.e. appeared in ``b``'s
   original catalogue), 0.0 elsewhere. The trainer already multiplies
@@ -38,17 +41,23 @@ benchmark is then re-expressed against this joint row space:
 
 Optional positive-mass pruning
 ------------------------------
-When ``--mass_coverage`` is specified (e.g. ``0.95``), we compute the total
-*measured* positive ``Δ`` mass for every joint row::
+When ``--mass_coverage`` is set (e.g. ``0.95``), **by default** we use
+**marginal greedy** selection on stacked dense positives (requires a dense
+``Δ`` matrix for every benchmark in the union): iteratively pick the joint
+program whose column adds the most *additional* positive mass on top of the
+per-question max already achieved by previously selected programs, until the
+sum of those per-question maxima reaches ``coverage`` times the stacked
+oracle ``Σ_q max_r Δ(q,r)``. Row 0 (anchor) is always kept and seeded first.
 
-    mass[r] = Σ_b  Σ_q  max(0, Δ_b(q, r)) · keep_b(r)
+Pass ``--row_mass_prefix`` to use the older one-shot rule instead: rank rows
+by the decoupled score
 
-where ``keep_b(r) == 1`` iff row ``r`` was in benchmark ``b``'s original
-catalogue (unmeasured rows do not contribute). Rows are then ranked by
-``mass`` and the smallest prefix achieving ``mass_coverage * total`` is
-retained. The empty (anchor) program is *always* kept. When no dense
-matrices are supplied we fall back to the same computation over observed
-``(obs_indices, obs_deltas)`` pairs from ``observed/{b}.jsonl``.
+    mass[r] = Σ_b Σ_q max(0, Δ_b(q,r)) · keep_b(r)
+
+and take the smallest prefix whose summed ``mass`` hits ``coverage`` of
+``Σ_r mass[r]`` (programs can double-count the same question). When dense
+matrices are missing for any benchmark, row-prefix selection is used
+automatically, with observed ``(obs_indices, obs_deltas)`` if needed.
 
 Usage
 -----
@@ -186,36 +195,71 @@ def _build_joint_row_set(
 # ---------------------------------------------------------------------------
 
 
-def _remap_dense_matrix(
-    dense_payload: Dict[str, Any],
+def _remap_dense_columns(
+    dm: torch.Tensor,
     bench_row_to_joint: Dict[int, int],
     N_joint: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Project ``delta_matrix [Qb, N_b]`` onto ``[Qb, N_joint]``.
+) -> torch.Tensor:
+    """Project a ``[Qb, N_b]`` route matrix onto ``[Qb, N_joint]`` (column scatter).
 
-    Columns of ``bench_row_to_joint`` that map outside the bench's
-    original row space (i.e. joint rows not present on ``b``) are left as
-    zero. The caller is responsible for emitting a ``keep_mask`` that
-    marks those columns unmeasured so the CE loss never sees them as
-    zero-delta supervision.
+    Same layout semantics as the former ``_remap_dense_matrix`` body: unmapped
+    joint columns stay zero; ``keep_mask`` gates supervision on those slots.
     """
-    dm = dense_payload["delta_matrix"].float()
-    au = dense_payload["anchor_utilities"].float()
     N_b = int(dm.shape[1])
     if max(bench_row_to_joint.keys(), default=-1) >= N_b:
         raise ValueError(
             f"bench_row_to_joint references row {max(bench_row_to_joint.keys())} "
-            f"but delta_matrix has N_b={N_b} columns"
+            f"but dense matrix has N_b={N_b} columns"
         )
     Qb = int(dm.shape[0])
     joint_dm = torch.zeros(Qb, N_joint, dtype=dm.dtype)
-    # Gather source columns and place them at their joint-row indices.
     src_cols = torch.tensor(sorted(bench_row_to_joint.keys()), dtype=torch.long)
     tgt_cols = torch.tensor(
         [bench_row_to_joint[int(c)] for c in src_cols.tolist()], dtype=torch.long,
     )
     joint_dm.index_copy_(1, tgt_cols, dm.index_select(1, src_cols))
-    return joint_dm, au
+    return joint_dm
+
+
+def _remap_dense_payload_for_joint(
+    dense_payload: Dict[str, Any],
+    bench_row_to_joint: Dict[int, int],
+    N_joint: int,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Remap per-bench dense mined tensors into joint column space.
+
+    Copies **continuous** ``delta_matrix`` / ``anchor_utilities`` and, when the
+    payload includes **binary** supervision from ``dense_reevaluation.py``,
+    ``delta_matrix_binary`` / ``anchor_accuracies`` with the same column remap
+    (anchor accuracies are per-question only; rows stay aligned).
+    """
+    dm = dense_payload["delta_matrix"].float()
+    au = dense_payload["anchor_utilities"].float()
+    joint_dm = _remap_dense_columns(dm, bench_row_to_joint, N_joint)
+
+    d_bin_o = dense_payload.get("delta_matrix_binary")
+    aa_o = dense_payload.get("anchor_accuracies")
+    if (d_bin_o is not None) ^ (aa_o is not None):
+        raise ValueError(
+            "dense payload must include both 'delta_matrix_binary' and 'anchor_accuracies' "
+            f"or neither (got binary={d_bin_o is not None}, acc={aa_o is not None})."
+        )
+    if d_bin_o is None:
+        return joint_dm, au, None, None
+    d_bin = d_bin_o.float()
+    aa = aa_o.float()
+    if d_bin.shape != dm.shape:
+        raise ValueError(
+            f"delta_matrix_binary shape {tuple(d_bin.shape)} != "
+            f"delta_matrix {tuple(dm.shape)}"
+        )
+    if aa.shape != au.shape:
+        raise ValueError(
+            f"anchor_accuracies shape {tuple(aa.shape)} != "
+            f"anchor_utilities {tuple(au.shape)}"
+        )
+    joint_bin = _remap_dense_columns(d_bin, bench_row_to_joint, N_joint)
+    return joint_dm, au, joint_bin, aa
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +391,87 @@ def _select_rows_for_mass_coverage(
     return sorted(keep)
 
 
+def _stack_joint_positive_dense_for_marginal(
+    joint_dense_per_bench: Dict[str, Optional[torch.Tensor]],
+    joint_keep_mask_per_bench: Dict[str, torch.Tensor],
+    selected: Sequence[str],
+    train_question_ids_per_bench: Optional[Dict[str, set]],
+) -> torch.Tensor:
+    """Stack ``clamp(Δ,0) * keep_mask`` rows from every benchmark (train-only when split given)."""
+    blocks: List[torch.Tensor] = []
+    for b in selected:
+        dm = joint_dense_per_bench[b]
+        if dm is None:
+            continue
+        km = joint_keep_mask_per_bench[b].to(device=dm.device, dtype=torch.float32)
+        xb = torch.clamp(dm.float(), min=0.0) * km.unsqueeze(0)
+        if train_question_ids_per_bench is not None:
+            train_set = train_question_ids_per_bench.get(b)
+            if train_set:
+                qb = int(xb.shape[0])
+                idx = sorted(int(q) for q in train_set if 0 <= int(q) < qb)
+                if len(idx) != qb:
+                    logger.info(
+                        "[marginal-greedy] bench=%s: %d/%d train rows contribute to selection mass",
+                        b, len(idx), qb,
+                    )
+                if not idx:
+                    continue
+                xb = xb.index_select(0, torch.tensor(idx, dtype=torch.long, device=xb.device))
+        blocks.append(xb)
+    if not blocks:
+        raise ValueError("marginal greedy requires at least one dense Δ matrix block")
+    stacked = torch.cat(blocks, dim=0)
+    return stacked.to(dtype=torch.float64, device=torch.device("cpu"))
+
+
+def _select_rows_marginal_greedy_coverage(
+    X: torch.Tensor,
+    coverage: float,
+    *,
+    always_keep: Sequence[int] = (0,),
+) -> Tuple[List[int], torch.Tensor, List[int]]:
+    """Greedy column cover: maximize incremental Σ_q max(0, X[q,j] - best_q).
+
+    Stops when Σ_q best_q >= coverage * Σ_q max_j X[q,j] or no positive gain.
+    Returns (kept_sorted, final_best_per_row, pick_order_without_always_keep).
+    """
+    n, m = X.shape
+    if m == 0:
+        return [], X.new_zeros(n), []
+    best = torch.zeros(n, dtype=X.dtype, device=X.device)
+    rem = torch.ones(m, dtype=torch.bool, device=X.device)
+    for r in always_keep:
+        ri = int(r)
+        if 0 <= ri < m:
+            best = torch.maximum(best, X[:, ri])
+            rem[ri] = False
+    oracle = X.max(dim=1).values.sum()
+    otf = float(oracle.item())
+    kept: set[int] = {int(r) for r in always_keep if 0 <= int(r) < m}
+    pick_order: List[int] = []
+    if otf <= 0.0:
+        logger.warning("marginal greedy: oracle sum is 0; keeping only always-keep rows.")
+        return sorted(kept), best, pick_order
+    if coverage >= 1.0:
+        target = otf
+    else:
+        target = float(coverage) * otf
+    eps = 1e-12
+    while float(best.sum().item()) + eps < target:
+        diff = torch.clamp(X - best.unsqueeze(1), min=0.0)
+        gains = diff.sum(dim=0)
+        gains = gains.masked_fill(~rem, -1.0)
+        j = int(torch.argmax(gains).item())
+        if float(gains[j].item()) <= eps:
+            break
+        kept.add(j)
+        pick_order.append(j)
+        rem[j] = False
+        best = torch.maximum(best, X[:, j])
+    return sorted(kept), best, pick_order
+
+
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
@@ -361,6 +486,7 @@ def build_joint_catalogue(
     mass_coverage: Optional[float] = None,
     train_question_ids_per_bench: Optional[Dict[str, Sequence[int]]] = None,
     split_json_path: Optional[Path] = None,
+    mass_marginal_greedy: bool = True,
 ) -> Dict[str, Any]:
     """Build a joint compositional catalogue (union of canonical programs).
 
@@ -378,8 +504,15 @@ def build_joint_catalogue(
         When supplied, their columns are remapped to the joint row space
         and written to ``output_dir / dense_deltas / {b}.pt``.
     mass_coverage
-        When set (e.g. ``0.95``), prune the joint row set to the smallest
-        prefix covering that fraction of total positive ``Δ`` mass.
+        When set (e.g. ``0.95``), prune the joint row set. By default
+        (**marginal greedy**, see ``mass_marginal_greedy``) this targets
+        a fraction of stacked *oracle* mass ``Σ_q max_r Δ^+(q,r)``; the
+        legacy row-prefix mode targets ``Σ_r mass[r]`` instead.
+    mass_marginal_greedy
+        When ``True`` (default) and every selected benchmark has a dense
+        ``Δ`` matrix, use iterative marginal-greedy column selection. If
+        dense is missing anywhere, automatically fall back to per-row mass
+        ranking (same as ``False``).
     """
     catalogue_dir = Path(catalogue_dir)
     output_dir = Path(output_dir)
@@ -416,17 +549,25 @@ def build_joint_catalogue(
     dense_delta_paths = dict(dense_delta_paths or {})
     joint_dense_per_bench: Dict[str, Optional[torch.Tensor]] = {}
     joint_anchor_per_bench: Dict[str, Optional[torch.Tensor]] = {}
+    joint_dense_binary_per_bench: Dict[str, Optional[torch.Tensor]] = {}
+    joint_anchor_acc_per_bench: Dict[str, Optional[torch.Tensor]] = {}
     for b in selected:
         if b in dense_delta_paths:
             raw = load_torch(dense_delta_paths[b])
             if "delta_matrix" not in raw or "anchor_utilities" not in raw:
                 raise KeyError(f"{dense_delta_paths[b]}: missing delta_matrix / anchor_utilities")
-            dm_j, au = _remap_dense_matrix(raw, bench_row_to_joint[b], N_joint_union)
+            dm_j, au, dm_bin_j, aa_j = _remap_dense_payload_for_joint(
+                raw, bench_row_to_joint[b], N_joint_union,
+            )
             joint_dense_per_bench[b] = dm_j
             joint_anchor_per_bench[b] = au
+            joint_dense_binary_per_bench[b] = dm_bin_j
+            joint_anchor_acc_per_bench[b] = aa_j
         else:
             joint_dense_per_bench[b] = None
             joint_anchor_per_bench[b] = None
+            joint_dense_binary_per_bench[b] = None
+            joint_anchor_acc_per_bench[b] = None
 
     observed_per_bench: Dict[str, List[Dict[str, Any]]] = {}
     for b in selected:
@@ -470,49 +611,92 @@ def build_joint_catalogue(
         }
 
     if mass_coverage is not None:
-        if any(dm is not None for dm in joint_dense_per_bench.values()):
-            mass = _positive_mass_per_row_from_dense(
+        dense_ready = all(joint_dense_per_bench.get(b) is not None for b in selected)
+        use_marginal = bool(mass_marginal_greedy) and dense_ready
+        if bool(mass_marginal_greedy) and not dense_ready:
+            logger.warning(
+                "mass_marginal_greedy=True but dense Δ matrices are missing for some "
+                "benchmarks; using per-row positive-mass ranking instead.",
+            )
+        pruning_info["mass_marginal_greedy"] = bool(use_marginal)
+        pruning_info["train_only_mass"] = train_qids_sets is not None
+
+        if use_marginal:
+            x_stack = _stack_joint_positive_dense_for_marginal(
+                joint_dense_per_bench, joint_keep_mask_per_bench, selected, train_qids_sets,
+            )
+            kept_rows, best_final, pick_order = _select_rows_marginal_greedy_coverage(
+                x_stack, float(mass_coverage), always_keep=(0,),
+            )
+            oracle_cov = float(x_stack.max(dim=1).values.sum().item())
+            achieved_cov = float(best_final.sum().item())
+            mass_diag = _positive_mass_per_row_from_dense(
                 joint_dense_per_bench, joint_keep_mask_per_bench,
                 train_question_ids_per_bench=train_qids_sets,
             )
+            pruning_info["mass_selection"] = "marginal_greedy_dense"
             pruning_info["mass_source"] = "dense"
-        else:
-            mass = _positive_mass_per_row_from_observed(
-                observed_per_bench, bench_row_to_joint, N_joint_union,
-                train_question_ids_per_bench=train_qids_sets,
+            pruning_info["oracle_stacked_sum"] = oracle_cov
+            pruning_info["achieved_covered_sum"] = achieved_cov
+            pruning_info["achieved_frac_of_oracle"] = (
+                achieved_cov / oracle_cov if oracle_cov > 1e-12 else 0.0
             )
-            pruning_info["mass_source"] = "observed"
-        pruning_info["train_only_mass"] = train_qids_sets is not None
-        kept_rows = _select_rows_for_mass_coverage(mass, coverage=float(mass_coverage))
-        pruning_info["total_positive_mass"] = float(mass.sum().item())
-        pruning_info["kept_positive_mass"] = float(mass[kept_rows].sum().item())
-        pruning_info["n_kept"] = len(kept_rows)
+            pruning_info["marginal_pick_order"] = [int(x) for x in pick_order]
+            pruning_info["total_positive_mass"] = float(mass_diag.sum().item())
+            pruning_info["kept_positive_mass"] = float(mass_diag[kept_rows].sum().item())
+            pruning_info["n_kept"] = len(kept_rows)
+            logger.info(
+                "mass-coverage (marginal greedy): kept %d / %d joint rows; "
+                "covered mass %.4f / oracle %.4f (%.1f%% of oracle).",
+                len(kept_rows), N_joint_union, achieved_cov, oracle_cov,
+                100.0 * achieved_cov / max(oracle_cov, 1e-12),
+            )
+        else:
+            if any(dm is not None for dm in joint_dense_per_bench.values()):
+                mass = _positive_mass_per_row_from_dense(
+                    joint_dense_per_bench, joint_keep_mask_per_bench,
+                    train_question_ids_per_bench=train_qids_sets,
+                )
+                pruning_info["mass_source"] = "dense"
+            else:
+                mass = _positive_mass_per_row_from_observed(
+                    observed_per_bench, bench_row_to_joint, N_joint_union,
+                    train_question_ids_per_bench=train_qids_sets,
+                )
+                pruning_info["mass_source"] = "observed"
+            pruning_info["mass_selection"] = "row_mass_prefix"
+            kept_rows = _select_rows_for_mass_coverage(mass, coverage=float(mass_coverage))
+            pruning_info["total_positive_mass"] = float(mass.sum().item())
+            pruning_info["kept_positive_mass"] = float(mass[kept_rows].sum().item())
+            pruning_info["n_kept"] = len(kept_rows)
+            logger.info(
+                "mass-coverage (row-mass prefix): kept %d / %d rows covering "
+                "%.3f / %.3f summed row-mass (%.1f%%).",
+                len(kept_rows), N_joint_union,
+                pruning_info["kept_positive_mass"], pruning_info["total_positive_mass"],
+                100.0 * pruning_info["kept_positive_mass"] / max(pruning_info["total_positive_mass"], 1e-12),
+            )
 
         remap = {old: new for new, old in enumerate(kept_rows)}
         joint_keys = [joint_keys[r] for r in kept_rows]
         joint_prim_indices = [joint_prim_indices[r] for r in kept_rows]
         for b in selected:
             joint_keep_mask_per_bench[b] = joint_keep_mask_per_bench[b][kept_rows].contiguous()
+            col_idx = torch.tensor(kept_rows, dtype=torch.long)
             if joint_dense_per_bench[b] is not None:
                 joint_dense_per_bench[b] = (
-                    joint_dense_per_bench[b].index_select(1, torch.tensor(kept_rows, dtype=torch.long))
-                    .contiguous()
+                    joint_dense_per_bench[b].index_select(1, col_idx).contiguous()
                 )
-            # Bench row r_b now maps to ``remap.get(old_joint_r)`` or is *dropped*
-            # (if its old_joint_r was pruned away). Dropped rows will be removed
-            # from observed records below.
+            if joint_dense_binary_per_bench.get(b) is not None:
+                joint_dense_binary_per_bench[b] = (
+                    joint_dense_binary_per_bench[b].index_select(1, col_idx).contiguous()
+                )
             bench_row_to_joint[b] = {
                 r_b: remap[old]
                 for r_b, old in bench_row_to_joint[b].items()
                 if old in remap
             }
         N_joint = len(joint_keys)
-        logger.info(
-            "mass-coverage pruning: kept %d / %d rows covering %.3f / %.3f positive mass (%.1f%%).",
-            len(kept_rows), N_joint_union,
-            pruning_info["kept_positive_mass"], pruning_info["total_positive_mass"],
-            100.0 * pruning_info["kept_positive_mass"] / max(pruning_info["total_positive_mass"], 1e-12),
-        )
     else:
         N_joint = N_joint_union
 
@@ -606,6 +790,9 @@ def build_joint_catalogue(
                 "n_programs": N_joint,
                 "source_bench": b,
             }
+            if joint_dense_binary_per_bench.get(b) is not None:
+                payload["delta_matrix_binary"] = joint_dense_binary_per_bench[b].contiguous()
+                payload["anchor_accuracies"] = joint_anchor_acc_per_bench[b].contiguous()
             save_torch(dense_out_dir / f"{b}.pt", payload)
         mask_out_dir.mkdir(parents=True, exist_ok=True)
         save_torch(
@@ -712,9 +899,13 @@ def _build_argparser() -> argparse.ArgumentParser:
                         "Remapped columns are written to <output_dir>/dense_deltas/{bench}.pt "
                         "along with a keep_mask.")
     p.add_argument("--mass_coverage", type=float, default=None,
-                   help="When set in (0, 1], prune joint rows to the smallest prefix "
-                        "covering this fraction of total positive Δ mass. Row 0 (anchor) "
-                        "is always kept.")
+                   help="When set in (0, 1], prune joint rows. Default: marginal greedy "
+                        "on stacked dense positives (needs dense for every benchmark).")
+    p.add_argument(
+        "--row_mass_prefix",
+        action="store_true",
+        help="Use legacy per-row mass ranking + prefix (not marginal greedy).",
+    )
     p.add_argument("--split_json", type=Path, default=None,
                    help="Path to a canonical train/val/test split JSON (produced by "
                         "scripts/make_canonical_split.py). When set, mass-coverage "
@@ -739,6 +930,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dense_delta_paths=dense_paths,
         mass_coverage=args.mass_coverage,
         split_json_path=args.split_json,
+        mass_marginal_greedy=not args.row_mass_prefix,
     )
     return 0
 

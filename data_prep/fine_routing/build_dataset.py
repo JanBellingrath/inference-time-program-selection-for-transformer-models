@@ -55,6 +55,7 @@ from routers.fine_routing_deviations import (
 )
 from core.flexible_models import FlexibleModelWrapper, get_is_instruct
 from core.permutation_mcts import prepare_arc_data
+from pipeline.forward import get_pivot_residual
 from training.train_benchmark_router import load_optimal_sequences_from_results
 
 logging.basicConfig(
@@ -314,7 +315,8 @@ def build_dataset_for_benchmark(
             anchor_score = anchor_b
 
             # --- pivot residual (under anchor layer order) ---
-            pivot_res = wrapper.get_pivot_residual(
+            pivot_res = get_pivot_residual(
+                wrapper,
                 sample["input"],
                 layer_indices=anchor_layers,
                 pivot_layer=cfg.pivot_layer,
@@ -505,7 +507,8 @@ def build_dataset_mcts_for_benchmark(
                     desc=f"  {benchmark} (pivot catch-up)",
                 ):
                     sample = samples[q_idx]
-                    pivot_res = wrapper.get_pivot_residual(
+                    pivot_res = get_pivot_residual(
+                        wrapper,
                         sample["input"],
                         layer_indices=anchor_layers,
                         pivot_layer=cfg.pivot_layer,
@@ -524,7 +527,8 @@ def build_dataset_mcts_for_benchmark(
             )
             for q_idx in tqdm(range(start_idx), desc=f"  {benchmark} (pivot rebuild)"):
                 sample = samples[q_idx]
-                pivot_res = wrapper.get_pivot_residual(
+                pivot_res = get_pivot_residual(
+                    wrapper,
                     sample["input"],
                     layer_indices=anchor_layers,
                     pivot_layer=cfg.pivot_layer,
@@ -562,7 +566,8 @@ def build_dataset_mcts_for_benchmark(
                     parts.append(torch.tensor([conf, margin], dtype=torch.float32))
                 pivot_res_vec = torch.cat(parts, dim=-1)
             else:
-                pivot_res_vec = wrapper.get_pivot_residual(
+                pivot_res_vec = get_pivot_residual(
+                    wrapper,
                     sample["input"],
                     layer_indices=anchor_layers,
                     pivot_layer=cfg.pivot_layer,

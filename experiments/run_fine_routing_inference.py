@@ -49,6 +49,7 @@ from routers.fine_routing_deviations import (
 )
 from core.flexible_models import FlexibleModelWrapper, get_is_instruct
 from core.permutation_mcts import prepare_arc_data
+from pipeline.forward import get_pivot_residual
 from training.train_benchmark_router import load_optimal_sequences_from_results
 from train_fine_gate import FineGate
 from train_fine_router import FineRouter
@@ -236,7 +237,8 @@ def run_inference(
             anchor_correct += anchor_ok
 
             # --- pivot residual ---
-            h_pivot = wrapper.get_pivot_residual(
+            h_pivot = get_pivot_residual(
+                wrapper,
                 sample["input"],
                 layer_indices=anchor_layers,
                 pivot_layer=cfg.pivot_layer,
@@ -408,7 +410,8 @@ def run_inference_mcts(
             anchor_correct += anchor_ok
 
             # --- pivot residual ---
-            h_pivot = wrapper.get_pivot_residual(
+            h_pivot = get_pivot_residual(
+                wrapper,
                 sample["input"],
                 layer_indices=anchor_layers,
                 pivot_layer=cfg.pivot_layer,

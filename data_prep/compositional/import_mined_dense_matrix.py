@@ -7,6 +7,9 @@ writes ``delta_matrix [Q_all, N]`` whose **column** indices match compositional
 
 This script **slices** the first ``num_questions`` rows so rows align with
 ``question_id`` 0 .. ``num_questions-1`` in ``observed/{bench}.jsonl``.
+When the mined checkpoint includes ``delta_matrix_binary`` and
+``anchor_accuracies`` (the default from ``dense_reevaluation.py``), those
+tensors are sliced and copied alongside the continuous supervision.
 
 Example::
 
@@ -31,7 +34,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 from data_prep.common.io import load_torch, save_torch
-from data_prep.common.validation import validate_dense_shape
+from data_prep.common.validation import validate_dense_binary_sidecar, validate_dense_shape
 
 
 def import_mined(
@@ -56,8 +59,32 @@ def import_mined(
         "num_questions_sliced": int(num_questions),
         "full_shape": list(dm.shape),
     }
+    d_bin_o = payload.get("delta_matrix_binary")
+    aa_o = payload.get("anchor_accuracies")
+    if (d_bin_o is not None) ^ (aa_o is not None):
+        raise ValueError(
+            f"{mined_pt}: need both delta_matrix_binary and anchor_accuracies or neither"
+        )
+    if d_bin_o is not None:
+        d_bin = d_bin_o.float()
+        aa_bin = aa_o.float()
+        if d_bin.shape != dm.shape:
+            raise ValueError(
+                f"delta_matrix_binary shape {tuple(d_bin.shape)} != delta_matrix {tuple(dm.shape)}"
+            )
+        if aa_bin.shape != au.shape:
+            raise ValueError(
+                f"anchor_accuracies shape {tuple(aa_bin.shape)} != anchor_utilities {tuple(au.shape)}"
+            )
+        out["delta_matrix_binary"] = d_bin[:num_questions].contiguous()
+        out["anchor_accuracies"] = aa_bin[:num_questions].contiguous()
     output_pt = Path(output_pt)
     validate_dense_shape(out["delta_matrix"], out["anchor_utilities"], n_rows=num_questions)
+    if "delta_matrix_binary" in out:
+        validate_dense_binary_sidecar(
+            out["delta_matrix"], out["anchor_utilities"],
+            out["delta_matrix_binary"], out["anchor_accuracies"],
+        )
     save_torch(output_pt, out)
     return {
         "output": str(output_pt),

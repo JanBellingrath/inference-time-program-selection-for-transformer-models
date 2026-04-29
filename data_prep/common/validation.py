@@ -53,3 +53,24 @@ def validate_dense_shape(
             f"delta_matrix cols={delta_matrix.shape[1]} but expected {int(n_cols)}"
         )
 
+
+def validate_dense_binary_sidecar(
+    delta_matrix: torch.Tensor,
+    anchor_utilities: torch.Tensor,
+    delta_matrix_binary: torch.Tensor,
+    anchor_accuracies: torch.Tensor,
+) -> None:
+    """Ensure binary tensors match the continuous dense layout."""
+    if delta_matrix_binary.shape != delta_matrix.shape:
+        raise ValueError(
+            "delta_matrix_binary shape "
+            f"{tuple(delta_matrix_binary.shape)} != delta_matrix "
+            f"{tuple(delta_matrix.shape)}"
+        )
+    if anchor_accuracies.shape != anchor_utilities.shape:
+        raise ValueError(
+            "anchor_accuracies shape "
+            f"{tuple(anchor_accuracies.shape)} != anchor_utilities "
+            f"{tuple(anchor_utilities.shape)}"
+        )
+

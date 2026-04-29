@@ -1305,12 +1305,20 @@ class CompositionalDataset(Dataset):
         self.question_ids: List[int] = []
         self.dense_deltas_per_bench: Dict[str, Optional[torch.Tensor]] = {}
         self.anchor_utilities_per_bench: Dict[str, Optional[torch.Tensor]] = {}
+        # Optional sidecars (same Q, N as dense Δ): per-question anchor correctness
+        # and route Δ in binary / TALE space — used for true accuracy pp in training
+        # downstream eval. Omitted by ``data_prep/compositional/dense_from_canonical``.
+        self.dense_deltas_binary_per_bench: Dict[str, Optional[torch.Tensor]] = {}
+        self.anchor_accuracies_per_bench: Dict[str, Optional[torch.Tensor]] = {}
         self.dense_keep_mask_per_bench: Dict[str, Optional[torch.Tensor]] = {}
         self.local_moebius_per_bench: Dict[str, Optional[Dict[str, Any]]] = {}
         dense_delta_paths = dict(dense_delta_paths or {})
         observed_path_overrides = dict(observed_path_overrides or {})
         dense_keep_mask_paths = dict(dense_keep_mask_paths or {})
         local_moebius_paths = dict(local_moebius_paths or {})
+        for _b in benchmarks:
+            self.dense_deltas_binary_per_bench[_b] = None
+            self.anchor_accuracies_per_bench[_b] = None
 
         for bench in benchmarks:
             info = artifacts.manifest["benchmarks"].get(bench)
@@ -1350,6 +1358,29 @@ class CompositionalDataset(Dataset):
                         f"[{bench}] dense delta matrix has {dense_mat.shape[1]} "
                         f"routes but legal catalogue has {cat.n_programs} programs."
                     )
+                d_bin = payload.get("delta_matrix_binary")
+                aa_bin = payload.get("anchor_accuracies")
+                if (d_bin is not None) ^ (aa_bin is not None):
+                    raise ValueError(
+                        f"[{bench}] dense payload must include both "
+                        f"'delta_matrix_binary' and 'anchor_accuracies' or neither; "
+                        f"got binary_matrix={d_bin is not None} anchor_accuracies={aa_bin is not None}."
+                    )
+                if d_bin is not None:
+                    d_bin_t = d_bin.float()
+                    aa_t = aa_bin.float()
+                    if d_bin_t.shape != dense_mat.shape:
+                        raise ValueError(
+                            f"[{bench}] delta_matrix_binary shape {tuple(d_bin_t.shape)} "
+                            f"!= delta_matrix {tuple(dense_mat.shape)}."
+                        )
+                    if aa_t.shape != anchor_util.shape:
+                        raise ValueError(
+                            f"[{bench}] anchor_accuracies shape {tuple(aa_t.shape)} "
+                            f"!= anchor_utilities {tuple(anchor_util.shape)}."
+                        )
+                    self.dense_deltas_binary_per_bench[bench] = d_bin_t
+                    self.anchor_accuracies_per_bench[bench] = aa_t
             self.dense_deltas_per_bench[bench] = dense_mat
             keep_mask: Optional[torch.Tensor] = None
             if bench in dense_keep_mask_paths:

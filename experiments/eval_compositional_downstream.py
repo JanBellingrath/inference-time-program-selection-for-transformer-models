@@ -12,11 +12,14 @@ layer stack, grades the response, and reports:
 * ``uplift_pp``    — ``router_acc - anchor_acc`` in percentage points.
 
 This is the "unconditional gain in pp" companion to the training-time
-``mean_uplift`` (which is measured in nats of log P(correct answer
-token) and is what HPO optimises). Running this once on each HPO best
-checkpoint (over the full validation split, ~1k questions) gives a
-decoupled, interpretable accuracy-delta metric that we can log back to
-W&B via ``hpo/mean_uplift_pp``.
+``mean_uplift`` on the **dense supervision matrix** (often log-prob /
+nats — what HPO can optimise in-process). True task **accuracy** uplift
+in-process is available only when dense payloads include
+``delta_matrix_binary`` and ``anchor_accuracies``; then the trainer logs
+``mean_uplift_acc_pp``. Multiplying log-prob uplift by 100 is not reported.
+Running this script on each best checkpoint (full validation split) still
+gives decoupled LLM-graded pp; log back to W&B as ``hpo/mean_uplift_pp``
+(e.g. from :func:`experiments.unified_hpo.optuna_runner.log_best_external_eval`).
 
 Catalogue / split hygiene
 -------------------------

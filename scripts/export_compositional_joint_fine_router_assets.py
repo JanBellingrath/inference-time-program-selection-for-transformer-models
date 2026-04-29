@@ -11,6 +11,16 @@ Writes into *out_dir*:
   keyed by route id ``j-1`` for dense column ``j`` (column 0 = noop / STAY).
 * ``staging/`` — symlinks ``{bench}_pivot_residuals.pt`` to paths in ``manifest.json``.
 
+**Dense columns**
+
+* ``measured_only`` (default): skip columns where that benchmark's ``dense_masks``
+  ``keep_mask[j] < 0.5`` (matches compositional supervision on measured joint rows).
+* ``all_legal_programs``: emit **every** legal program column ``j >= 1``. Use this for
+  joint fine routing when each benchmark materializes programs on its own anchor
+  (``per_bench_catalog.json``): ambiguous primitives across anchors need not be
+  dropped from the **label space** — the same class index maps to different layer
+  sequences per benchmark.
+
 Example::
 
     python scripts/export_compositional_joint_fine_router_assets.py \\
@@ -62,6 +72,13 @@ def main() -> int:
         type=str,
         default=None,
         help="Benchmark whose anchor defines catalog.json routes (default: first of --benchmarks).",
+    )
+    ap.add_argument(
+        "--dense_columns",
+        type=str,
+        choices=("measured_only", "all_legal_programs"),
+        default="measured_only",
+        help="Whether to filter dense JSONL routes by per-bench keep_mask (default) or include all programs.",
     )
     args = ap.parse_args()
 
@@ -117,6 +134,10 @@ def main() -> int:
     pbc_path = out_dir / "per_bench_catalog.json"
     pbc_path.write_text(json.dumps(per_bench_catalog, indent=2))
 
+    anchor_path = out_dir / "anchor_seqs.json"
+    anchor_payload = {b: [int(x) for x in manifest["benchmarks"][b]["anchor"]] for b in bench_list}
+    anchor_path.write_text(json.dumps(anchor_payload, indent=2))
+
     staging = out_dir / "staging"
     staging.mkdir(parents=True, exist_ok=True)
     dense_path = out_dir / "dense_joint.jsonl"
@@ -153,10 +174,11 @@ def main() -> int:
                 if km_tensor is not None and int(km_tensor.numel()) != n_programs:
                     raise SystemExit(f"{bench}: keep_mask length mismatch")
 
+            use_mask = args.dense_columns == "measured_only"
             for q in range(Q):
                 rd: Dict[str, float] = {}
                 for j in range(1, n_programs):
-                    if km_tensor is not None and float(km_tensor[j].item()) < 0.5:
+                    if use_mask and km_tensor is not None and float(km_tensor[j].item()) < 0.5:
                         continue
                     d = float(delta_matrix[q, j].item())
                     rd[str(j - 1)] = d
@@ -170,17 +192,20 @@ def main() -> int:
 
     meta_out = {
         "catalogue_dir": str(cat_dir),
+        "catalogue_kind": manifest.get("catalogue_kind"),
         "reference_benchmark": ref_bench,
         "benchmarks": bench_list,
         "n_programs": n_programs,
         "n_selected_routes": len(selected_routes),
         "dense_lines": n_lines,
+        "dense_columns": args.dense_columns,
         "staging_dir": str(staging),
     }
     (out_dir / "export_meta.json").write_text(json.dumps(meta_out, indent=2))
 
     print(f"Wrote {catalog_path}  |selected_routes|={len(selected_routes)}", flush=True)
     print(f"Wrote {pbc_path}  benches={list(per_bench_catalog.keys())}", flush=True)
+    print(f"Wrote {anchor_path}", flush=True)
     print(f"Wrote {dense_path}  lines={n_lines}", flush=True)
     print(f"Staging symlinks in {staging}", flush=True)
     return 0

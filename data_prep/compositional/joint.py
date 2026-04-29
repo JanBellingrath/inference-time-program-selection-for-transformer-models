@@ -27,7 +27,7 @@ benchmark is then re-expressed against this joint row space:
   remapped to joint columns (columns that were not in ``b``'s original
   catalogue are zero-filled and will be masked). When the input dense file
   contains ``delta_matrix_binary`` / ``anchor_accuracies`` (from
-  ``dr-llm/data_prep/dense_reevaluation.py``), those tensors are remapped and
+  ``data_prep/dense_reevaluation.py``), those tensors are remapped and
   saved alongside the continuous supervision.
 * ``dense_masks/{b}.pt``          — ``keep_mask[N_joint]`` = 1.0 where
   joint row was measurable on benchmark ``b`` (i.e. appeared in ``b``'s

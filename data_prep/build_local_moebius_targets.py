@@ -6,7 +6,7 @@ Pipeline (Stage 3 of 3)
 
 Given the per-benchmark sidecar produced by
 :mod:`data_prep.build_local_subset_catalog` (Stage 1) and the
-``dense_deltas_matrix.pt`` produced by ``dr-llm/data_prep/dense_reevaluation.py``
+``dense_deltas_matrix.pt`` produced by ``data_prep/dense_reevaluation.py``
 (Stage 2, run unchanged on the catalog), this script extracts per-question
 anchor-relative subset utilities ``F_q(T;a)`` for the subsets each question
 actually requested, then emits local Möbius supervision targets:
@@ -274,7 +274,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--catalog_dir", required=True, type=Path,
                    help="Output of build_local_subset_catalog (per-bench subdirs).")
     p.add_argument("--decode_dir", required=True, type=Path,
-                   help="Output root of dr-llm dense_reevaluation runs (per-bench subdirs).")
+                   help="Decode root from dense_reevaluation (per-benchmark subdirs).")
     p.add_argument("--output_dir", required=True, type=Path,
                    help="Where to write local_moebius_{bench}.pt files.")
     p.add_argument("--benchmarks", nargs="*", default=None,

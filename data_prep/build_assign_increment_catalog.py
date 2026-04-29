@@ -15,7 +15,7 @@ routes coincide with structural routes that we have already mined.
 This script produces a ``selected_catalog.json`` containing **only the routes
 that the assign-extended catalogue introduces** (i.e. routes not present in
 the structural dense matrix). The output is consumed verbatim by
-``dr-llm/data_prep/dense_reevaluation.py``, so the increment is mined with
+``data_prep/dense_reevaluation.py``, so the increment is mined with
 the same prefix-trie hidden-state caching, the same model loader, and the
 same per-question scoring. Routes already covered by the existing dense
 matrix are skipped, so we pay LM cost only for genuinely new routes (which
@@ -33,7 +33,7 @@ Pipeline location
 Stage A.0 (existing) -- struct-only dense matrix already on disk.
 Stage A.1 (THIS SCRIPT) -- enumerate delta routes, write delta
     ``selected_catalog.json``.
-Stage A.2 (existing) -- run ``dr-llm/data_prep/dense_reevaluation.py
+Stage A.2 (existing) -- run ``python -m data_prep.dense_reevaluation
     --catalog_json <delta>/selected_catalog.json ...`` on the delta routes.
 Stage A.3 (NEW) -- ``data_prep/merge_dense_increment.py`` concatenates the
     struct dense matrix with the delta dense matrix and reorders columns

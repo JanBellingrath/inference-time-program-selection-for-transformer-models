@@ -900,7 +900,13 @@ def prepare_arc_data(
         correct_idx = labels.index(answer_key)
         answer_key = chr(65 + correct_idx)
         
-        return {"input": input_text, "correct": answer_key}
+        return {
+            "input": input_text,
+            "correct": answer_key,
+            "is_mc": True,
+            "choice_labels": list(labels),
+            "max_new_tokens": 1,
+        }
     
     def prepare_dart_sample(item):
         question = item["query"]

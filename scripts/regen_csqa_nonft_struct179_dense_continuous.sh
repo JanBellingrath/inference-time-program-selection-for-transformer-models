@@ -66,7 +66,7 @@ mkdir -p "$OUT"
 rm -f "$OUT/.dense_eval.lock"
 
 echo "[regen_csqa_struct179] dense_reevaluation -> $OUT"
-cd "$ROOT"
+cd "$FLEX"
 python -m data_prep.dense_reevaluation \
   --catalog_json "$CATALOG_DIR/selected_catalog.json" \
   --benchmarks commonsenseqa \

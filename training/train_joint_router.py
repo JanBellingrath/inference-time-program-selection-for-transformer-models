@@ -1153,6 +1153,28 @@ def _parse_ce_weights_by_bench(spec: Optional[str]) -> Optional[Dict[str, float]
     return out
 
 
+def _parse_benchmark_path_map(entries: Optional[List[str]]) -> Optional[Dict[str, str]]:
+    """Parse repeated ``bench=/abs/path`` entries (HF eval pivot ``config.json`` roots)."""
+    if not entries:
+        return None
+    out: Dict[str, str] = {}
+    for e in entries:
+        e = str(e).strip()
+        if not e:
+            continue
+        if "=" not in e:
+            raise ValueError(
+                f"Invalid --external_eval_canonical entry {e!r}. Expected format 'bench=path'.",
+            )
+        b, pth = e.split("=", 1)
+        b_key = b.strip()
+        p_abs = os.path.abspath(os.path.expanduser(pth.strip()))
+        if b_key in out:
+            raise ValueError(f"Duplicate benchmark in --external_eval_canonical: {b_key!r}")
+        out[b_key] = p_abs
+    return out or None
+
+
 def _ce_weight_vec_for_dataset(
     ce_weights_by_bench: Optional[Dict[str, float]],
     bench_names: List[str],
@@ -1306,6 +1328,14 @@ def train_joint_router(
     ce_weights_by_bench: Optional[Dict[str, float]] = None,
     split_json_path: Optional[str] = None,
     per_bench_catalog: Optional[Dict[str, List[Optional[List[int]]]]] = None,
+    wandb_tags: Optional[List[str]] = None,
+    asset_export_meta: Optional[Dict[str, Any]] = None,
+    external_eval_every: int = 0,
+    external_eval_per_bench: int = 300,
+    external_eval_model_name: Optional[str] = None,
+    external_eval_canonical_roots: Optional[Dict[str, str]] = None,
+    external_eval_start_index: int = 0,
+    external_eval_gate_ckpt: Optional[str] = None,
 ) -> Optional[str]:
     """Train a joint router over multiple benchmarks.  Returns checkpoint path."""
     if catalog_mode not in ("union", "intersection"):
@@ -1422,19 +1452,54 @@ def train_joint_router(
                 _val_idx.append(_i)
             else:
                 _skipped += 1
-        if not _val_idx:
-            raise RuntimeError(
-                f"split_json={split_json_path}: produced empty val set "
-                f"(train={len(_train_idx)}, skipped_test={_skipped}).",
-            )
         from torch.utils.data import Subset as _Subset
 
-        train_ds = _Subset(ds, _train_idx)
-        val_ds = _Subset(ds, _val_idx)
-        logger.info(
-            "[split_json] %s -> train=%d val=%d skipped_test=%d",
-            split_json_path, len(_train_idx), len(_val_idx), _skipped,
-        )
+        if not _val_idx:
+            # Mined dense rows may omit every val_question_id (small runs, or
+            # TRAIN_SPLITS=train-only); fall back to a fractional split of the
+            # train-key-matched rows so training / W&B smoke tests can complete.
+            if len(_train_idx) < 2:
+                raise RuntimeError(
+                    f"split_json={split_json_path}: produced empty val set and only "
+                    f"{len(_train_idx)} train-matched row(s); need ≥2 rows for fractional "
+                    f"fallback or mine rows that intersect val_question_ids.",
+                )
+            logger.warning(
+                "[split_json] %s: no mined rows matched val_question_ids "
+                "(train-matched=%d skipped_test=%d); splitting that pool "
+                "with val_fraction=%.3f.",
+                split_json_path,
+                len(_train_idx),
+                _skipped,
+                val_fraction,
+            )
+            _pool = _Subset(ds, _train_idx)
+            _n = len(_pool)
+            val_size = max(1, int(_n * val_fraction))
+            if val_size >= _n:
+                val_size = _n - 1
+            train_size = _n - val_size
+            train_ds, val_ds = random_split(
+                _pool,
+                [train_size, val_size],
+                generator=torch.Generator().manual_seed(seed),
+            )
+            logger.info(
+                "[split_json] %s -> fallback train=%d val=%d (from train-key pool)",
+                split_json_path,
+                train_size,
+                val_size,
+            )
+        else:
+            train_ds = _Subset(ds, _train_idx)
+            val_ds = _Subset(ds, _val_idx)
+            logger.info(
+                "[split_json] %s -> train=%d val=%d skipped_test=%d",
+                split_json_path,
+                len(_train_idx),
+                len(_val_idx),
+                _skipped,
+            )
     else:
         val_size = max(1, int(len(ds) * val_fraction))
         train_size = len(ds) - val_size
@@ -1532,11 +1597,20 @@ def train_joint_router(
             "n_params": n_params,
             "catalog_mode": catalog_mode,
         }
+        if external_eval_every and external_eval_every > 0:
+            wb_cfg["external_eval_every"] = int(external_eval_every)
+            wb_cfg["external_eval_per_bench"] = int(external_eval_per_bench or 0)
+            wb_cfg["external_eval_model_name"] = external_eval_model_name
+            wb_cfg["external_eval_roots"] = dict(external_eval_canonical_roots or {})
+        if asset_export_meta:
+            wb_cfg["asset_export"] = dict(asset_export_meta)
+        _tags = [t for t in (wandb_tags or []) if t]
         wandb.init(
             project=wandb_project,
             name=wandb_run_name,
             group=wandb_group,
             config=wb_cfg,
+            tags=_tags or None,
         )
         run_wandb = True
 
@@ -1836,25 +1910,94 @@ def train_joint_router(
                     epoch, train_loss, val_loss, top1_acc, best_epoch,
                 )
     
-            if run_wandb:
-                lr_now = scheduler.get_last_lr()[0] if hasattr(scheduler, "get_last_lr") else optimizer.param_groups[0]["lr"]
-                wandb.log(
-                    {
-                        "train/loss": train_loss,
-                        "train/ce": train_ce,
-                        "train/rob": train_rob,
-                        "train/invalid": train_invalid,
-                        "train/bal_L": train_bal,
-                        "val/loss": val_loss,
-                        "val/ce": val_ce,
-                        "val/rob": val_rob,
-                        "val/invalid": val_invalid,
-                        "val/bal_L": val_bal,
-                        "val/top1": top1_acc,
-                        "lr": lr_now,
-                    },
-                    step=epoch,
+            lr_now = (
+                scheduler.get_last_lr()[0]
+                if hasattr(scheduler, "get_last_lr")
+                else optimizer.param_groups[0]["lr"]
+            )
+            log_payload: Dict[str, Any] = {
+                "train/loss": train_loss,
+                "train/ce": train_ce,
+                "train/rob": train_rob,
+                "train/invalid": train_invalid,
+                "train/bal_L": train_bal,
+                "val/loss": val_loss,
+                "val/ce": val_ce,
+                "val/rob": val_rob,
+                "val/invalid": val_invalid,
+                "val/bal_L": val_bal,
+                "val/top1": top1_acc,
+                "lr": lr_now,
+            }
+
+            trigger_ext = (
+                external_eval_every > 0
+                and external_eval_model_name
+                and external_eval_canonical_roots
+                and not use_dual_encoder
+                and not use_full_seq
+                and (epoch % external_eval_every == 0 or epoch == epochs)
+            )
+            if trigger_ext:
+                ext_path = os.path.join(output_dir, "_tmp_external_eval.pt")
+                _save_checkpoint(
+                    ext_path, epoch, model, compressor_cfg, num_classes,
+                    hidden_dims, dropout, ds, anchor_seqs,
+                    gate_positives_only, noop_boost, hard_ce_supervision,
+                    robust_temperature=robust_temperature,
+                    lambda_rob=lambda_rob,
+                    beta_invalid=beta_invalid,
+                    lambda_bal_cond_entropy=lambda_bal_cond_entropy,
+                    mask_stay_logits=mask_stay_logits,
+                    use_dual_encoder=use_dual_encoder,
+                    route_dim=route_dim,
+                    route_enc_layers=route_enc_layers,
+                    route_enc_heads=route_enc_heads,
+                    dense_supervision_topk=dense_supervision_topk,
+                    catalog_mode=catalog_mode,
+                    ce_weights_by_bench=ce_weights_by_bench,
+                    per_bench_catalog=per_bench_catalog,
                 )
+                try:
+                    from experiments.eval_joint_router_downstream import (
+                        run_hf_external_eval_joint_checkpoint,
+                    )
+
+                    ext_metrics = run_hf_external_eval_joint_checkpoint(
+                        ckpt_path=ext_path,
+                        model_name=external_eval_model_name,
+                        canonical_root_by_bench=external_eval_canonical_roots,
+                        bench_names=benchmarks,
+                        per_bench=external_eval_per_bench,
+                        device=device,
+                        start_index=external_eval_start_index,
+                        gate_ckpt_path=external_eval_gate_ckpt,
+                    )
+                    for rk, rv in ext_metrics.items():
+                        if isinstance(rv, (float, int)):
+                            safe_k = rk.replace("/", "_")
+                            log_payload[f"external_hf/{safe_k}"] = float(rv)
+                    logger.info(
+                        "Epoch %d external HF: pooled gain=%.4f routed=%.4f anchor=%.4f n=%s",
+                        epoch,
+                        float(ext_metrics.get("unconditional_gain", 0.0)),
+                        float(ext_metrics.get("routed_accuracy", 0.0)),
+                        float(ext_metrics.get("anchor_accuracy", 0.0)),
+                        ext_metrics.get("n"),
+                    )
+                except Exception:
+                    logger.exception(
+                        "External HF eval failed (epoch %d); continuing training",
+                        epoch,
+                    )
+                finally:
+                    try:
+                        os.remove(ext_path)
+                    except OSError:
+                        pass
+
+            if run_wandb:
+                wandb.log(log_payload, step=epoch)
 
     finally:
         if run_wandb:
@@ -2329,7 +2472,74 @@ def main():
     p.add_argument("--wandb_project", type=str, default="joint-router")
     p.add_argument("--wandb_run_name", type=str, default=None)
     p.add_argument("--wandb_group", type=str, default=None)
+    p.add_argument(
+        "--wandb_tags",
+        nargs="+",
+        default=None,
+        help="Optional W&B run tags (e.g. no_footpoint_prune all_dense_columns).",
+    )
+    p.add_argument(
+        "--asset_export_meta_json",
+        type=str,
+        default=None,
+        help="Optional export_meta.json from export_compositional_joint_fine_router_assets.py (logged to W&B config).",
+    )
+    p.add_argument(
+        "--external_eval_every",
+        type=int,
+        default=0,
+        help="If >0, run HF downstream eval (eval_joint_router_downstream) every N epochs "
+             "and on the last epoch when N does not divide epochs. Requires --external_eval_canonical.",
+    )
+    p.add_argument(
+        "--external_eval_per_bench",
+        type=int,
+        default=300,
+        help="HF validation questions per benchmark during external eval.",
+    )
+    p.add_argument(
+        "--external_eval_model_name",
+        type=str,
+        default=None,
+        help="HF model id for external eval (defaults to Qwen2.5-0.5B-Instruct when "
+             "--external_eval_every is set).",
+    )
+    p.add_argument(
+        "--external_eval_canonical",
+        nargs="*",
+        default=None,
+        help="Repeated bench=/path entries: each path is a canonical / MCTS dir with config.json "
+             "for pivot_layer (one per training benchmark).",
+    )
+    p.add_argument(
+        "--external_eval_start_index",
+        type=int,
+        default=0,
+        help="Offset into HF validation split before taking --external_eval_per_bench samples.",
+    )
+    p.add_argument(
+        "--external_eval_gate_ckpt",
+        type=str,
+        default=None,
+        help="Optional gate .pt for external eval (same schema as eval_joint_router_downstream).",
+    )
     args = p.parse_args()
+
+    try:
+        ext_eval_roots = _parse_benchmark_path_map(args.external_eval_canonical)
+    except ValueError as err:
+        logger.error("%s", err)
+        sys.exit(1)
+
+    ext_eval_model = args.external_eval_model_name
+    if int(args.external_eval_every) > 0:
+        if ext_eval_model is None:
+            ext_eval_model = "Qwen/Qwen2.5-0.5B-Instruct"
+        if not ext_eval_roots:
+            logger.error(
+                "--external_eval_every > 0 requires --external_eval_canonical bench=path ...",
+            )
+            sys.exit(1)
 
     benchmarks = []
     for b in args.benchmarks:
@@ -2377,6 +2587,17 @@ def main():
                 else:
                     parsed_row.append([int(x) for x in _ent])
             per_bench_catalog[str(_b)] = parsed_row
+
+    asset_export_meta: Optional[Dict[str, Any]] = None
+    if args.asset_export_meta_json:
+        with open(args.asset_export_meta_json) as _mf:
+            asset_export_meta = json.load(_mf)
+        logger.info(
+            "Loaded asset_export_meta: catalogue_kind=%s n_programs=%s dense_columns=%s",
+            asset_export_meta.get("catalogue_kind"),
+            asset_export_meta.get("n_programs"),
+            asset_export_meta.get("dense_columns"),
+        )
 
     if args.pretrain_dense_gate:
         if not args.dense_deltas_jsonl:
@@ -2438,6 +2659,18 @@ def main():
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
         wandb_group=args.wandb_group,
+        wandb_tags=args.wandb_tags,
+        asset_export_meta=asset_export_meta,
+        external_eval_every=int(args.external_eval_every),
+        external_eval_per_bench=args.external_eval_per_bench,
+        external_eval_model_name=(
+            ext_eval_model if int(args.external_eval_every) > 0 else None
+        ),
+        external_eval_canonical_roots=(
+            ext_eval_roots if int(args.external_eval_every) > 0 else None
+        ),
+        external_eval_start_index=args.external_eval_start_index,
+        external_eval_gate_ckpt=args.external_eval_gate_ckpt,
     )
 
 

@@ -21,7 +21,7 @@
 #   D. scripts/build_dense_catalog_from_legal_programs
 #                                                   (manifest    -> selected_catalog.json
 #                                                                   = the route set the dense eval will mine)
-#   E. dr-llm/data_prep/dense_reevaluation.py       (catalog x split  -> dense_deltas.jsonl + dense_deltas_matrix.pt)
+#   E. python -m data_prep.dense_reevaluation   (catalog × split → dense_deltas.jsonl + dense_deltas_matrix.pt)
 #                                                   (every route applied to every question; resumes from the
 #                                                    longest contiguous global_question_id prefix)
 #   F. data_prep.import_mined_dense_matrix          (dense matrix -> compositional layout)
@@ -389,7 +389,7 @@ for SPLIT in $SPLITS; do
     # JSONL's first record; merge_source_dir attaches the original MCTS row
     # for train (no-op when split is something other than the MCTS split).
     run_until_ok "dense_reevaluation_${SPLIT}" \
-      bash -lc "cd '$DR_LLM_DIR' && python data_prep/dense_reevaluation.py \
+      bash -lc "cd '$ROOT' && python -m data_prep.dense_reevaluation \
         --catalog_json '$CATALOG_JSON' \
         --benchmarks '$BENCH' \
         --model_name '$MODEL_NAME' \

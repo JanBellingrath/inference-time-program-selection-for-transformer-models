@@ -6,7 +6,7 @@
 #   2. Re-builds primitive_support / compositional manifest with assign      (existing CLI)
 #   3. Builds a *delta* selected_catalog.json containing only the routes that
 #      the assign-extended catalogue introduces                                     (NEW)
-#   4. Calls dr-llm/data_prep/dense_reevaluation.py on the delta catalog
+#   4. Calls python -m data_prep.dense_reevaluation on the delta catalog
 #      (uses the same prefix-trie hidden-state caching as the original run)         (existing CLI)
 #   5. Merges old + new dense outputs into a unified dense_deltas_matrix.pt /
 #      dense_deltas.jsonl / selected_catalog.json, ordered to match the
@@ -23,10 +23,11 @@
 #   --unified_dense_dir       .../decode_compositional_unified/                     (final unified outputs)
 #   --bench                   commonsenseqa
 #   --model_name              Qwen/Qwen2.5-0.5B-Instruct
-#   --dr_llm_dir              /home/janerik/generalized_transformer-2/dr-llm
 #
 # Optional
 # --------
+#   --dr_llm_dir              deprecated, ignored (kept so old wrappers parse)
+
 #   --adapter_path PATH       LoRA adapter dir (forwarded to dense_reevaluation)
 #   --split STR               default: train (matches the original Stage A run)
 #   --batch_size N            default: 4
@@ -137,8 +138,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -n "${DR_LLM_DIR:-}" ]]; then
+  echo "[mine_assign_increment] ignoring deprecated --dr_llm_dir (${DR_LLM_DIR})" >&2
+fi
+
 for v in RAW_DATA_DIR NEW_CANONICAL_DIR NEW_COMPOSITIONAL_DIR OLD_DENSE_DIR \
-         INCREMENT_CATALOG_DIR NEW_DENSE_DIR UNIFIED_DENSE_DIR BENCH MODEL_NAME DR_LLM_DIR; do
+         INCREMENT_CATALOG_DIR NEW_DENSE_DIR UNIFIED_DENSE_DIR BENCH MODEL_NAME; do
   if [[ -z "${!v}" ]]; then
     echo "Missing --$(echo "$v" | tr '[:upper:]' '[:lower:]')" >&2
     exit 2
@@ -218,7 +223,7 @@ if [[ "$SKIP_DENSE" -eq 0 ]]; then
   [[ -n "$ADAPTER_PATH" ]] && ADAPTER_FLAG+=(--adapter_path "$ADAPTER_PATH")
   MERGE_FLAG=()
   [[ "$NO_MERGE_MCTS" -eq 1 ]] && MERGE_FLAG+=(--no_merge_mcts)
-  ( cd "$DR_LLM_DIR" && \
+  ( cd "$ROOT" && \
     python -m data_prep.dense_reevaluation \
       --catalog_json "$INCREMENT_CATALOG_DIR/selected_catalog.json" \
       --benchmarks "$BENCH" \

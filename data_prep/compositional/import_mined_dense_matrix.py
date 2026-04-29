@@ -1,6 +1,6 @@
 """Import a fully mined ``dense_deltas_matrix.pt`` into the compositional layout.
 
-The joint-router mining pipeline (``dr-llm/data_prep/dense_reevaluation.py``)
+The joint-router mining pipeline (``data_prep.dense_reevaluation``)
 writes ``delta_matrix [Q_all, N]`` whose **column** indices match compositional
 ``legal_programs/{bench}.jsonl`` row order (same 179 routes; verified by applying
 ``apply_program`` to the catalogue anchor).

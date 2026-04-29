@@ -5,7 +5,7 @@ Inputs
 ======
 
 * ``--old_dense_dir``: directory containing the struct-only dense outputs
-  produced by ``dr-llm/data_prep/dense_reevaluation.py``::
+  produced by ``data_prep/dense_reevaluation.py``::
 
       old_dense_dir/
         dense_deltas_matrix.pt   # {'delta_matrix', 'anchor_utilities', 'routes', ...};

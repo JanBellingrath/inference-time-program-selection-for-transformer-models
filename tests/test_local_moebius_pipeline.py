@@ -2,9 +2,9 @@
 
 Covers stages 1 and 3 of:
 
-    build_local_subset_catalog -> dr-llm dense_reevaluation -> build_local_moebius_targets
+    build_local_subset_catalog -> data_prep.dense_reevaluation -> build_local_moebius_targets
 
-(stage 2 is exercised in dr-llm; here we synthesize a ``dense_deltas_matrix.pt``
+(stage 2 dense eval is exercised in integration tests; here we synthesize ``dense_deltas_matrix.pt``
 by hand, which is exactly what dense_reevaluation would produce.)
 """
 

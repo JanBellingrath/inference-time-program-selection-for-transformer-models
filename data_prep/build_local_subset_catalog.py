@@ -20,7 +20,7 @@ which is exactly the same call already used by
 Outputs (under ``--output_dir/{bench}/``):
 
 * ``selected_catalog.json`` -- format consumed verbatim by
-  ``dr-llm/data_prep/dense_reevaluation.py``::
+  ``data_prep/dense_reevaluation.py``::
 
       {
         "selected_routes": [[layer, ...], ...],
@@ -51,10 +51,10 @@ Outputs (under ``--output_dir/{bench}/``):
       }
 
 Stage 2 (no Python edits anywhere): run unchanged
-``dr-llm/data_prep/dense_reevaluation.py --catalog_json ...`` per benchmark.
+``data_prep.dense_reevaluation --catalog_json ...`` per benchmark.
 
 Stage 3: ``data_prep/build_local_moebius_targets.py`` consumes the sidecar
-plus dr-llm's ``dense_deltas_matrix.pt`` and writes ``local_moebius_{bench}.pt``.
+plus merged ``dense_deltas_matrix.pt`` and writes ``local_moebius_{bench}.pt``.
 
 Usage
 -----

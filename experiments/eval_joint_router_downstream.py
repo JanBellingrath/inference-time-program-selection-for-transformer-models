@@ -24,7 +24,7 @@ import logging
 import os
 import sys as _sys
 from pathlib import Path as _Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 from tqdm import tqdm
@@ -98,6 +98,7 @@ def eval_checkpoint(
     gate_threshold_by_bench: Optional[Dict[str, float]] = None,
     gate_ckpt_path: Optional[str] = None,
     ignore_router_stay_when_open: bool = False,
+    pivot_layer_by_bench: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     route_model, meta = load_joint_router(ckpt_path, device=device)
     if meta.get("use_dual_encoder"):
@@ -125,6 +126,12 @@ def eval_checkpoint(
         b_anc = b_rout = 0
         b_open = 0
 
+        pl_b = int(
+            pivot_layer_by_bench[bench]
+            if pivot_layer_by_bench is not None and bench in pivot_layer_by_bench
+            else pivot_layer
+        )
+
         for sample in tqdm(samples, desc=f"{os.path.basename(ckpt_path)}:{bench}", leave=False):
             sys_p = sample.get("system_prompt")
             max_tok = sample["max_new_tokens"]
@@ -148,7 +155,7 @@ def eval_checkpoint(
                 wrapper,
                 sample["input"],
                 layer_indices=anchor_layers,
-                pivot_layer=pivot_layer,
+                pivot_layer=pl_b,
                 system_prompt=sys_p,
             )
             h_in = h_in.float().to(device).unsqueeze(0)
@@ -222,6 +229,67 @@ def eval_checkpoint(
             }
     out["ignore_router_stay_when_open"] = bool(ignore_router_stay_when_open)
     return out
+
+
+def run_hf_external_eval_joint_checkpoint(
+    *,
+    ckpt_path: str,
+    model_name: str,
+    canonical_root_by_bench: Dict[str, str],
+    bench_names: Sequence[str],
+    per_bench: int,
+    device: torch.device,
+    start_index: int = 0,
+    pivot_layer_override: int = -1,
+    gate_ckpt_path: Optional[str] = None,
+    gate_threshold: float = 0.15,
+    gate_threshold_by_bench: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    """Load the HF model and run :func:`eval_checkpoint` (for training hooks).
+
+    *canonical_root_by_bench* maps each benchmark to a directory that has
+    ``config.json`` with ``pivot_layer`` (same layout as MCTS data dirs).
+    """
+    is_instruct = get_is_instruct(model_name)
+    logger.info(
+        "External eval: loading LLM %s for checkpoint %s",
+        model_name, ckpt_path,
+    )
+    wrapper = FlexibleModelWrapper(model_name, rank=0)
+    pivot_by: Dict[str, int] = {}
+    for b in bench_names:
+        root = canonical_root_by_bench.get(str(b))
+        if not root:
+            raise ValueError(
+                f"external eval: missing canonical root for benchmark {b!r}",
+            )
+        pivot_by[str(b)] = _resolve_pivot_layer(root, model_name, pivot_layer_override)
+    val_samples: Dict[str, List[Dict]] = {}
+    for b in bench_names:
+        smp = prepare_arc_data(str(b), is_instruct=is_instruct, split="validation")
+        val_samples[str(b)] = smp[start_index : start_index + per_bench]
+        logger.info(
+            "  %s: %d HF val samples (pivot=%d)",
+            b, len(val_samples[str(b)]), pivot_by[str(b)],
+        )
+    gate_model = None
+    if gate_ckpt_path:
+        gate_model = load_joint_gate(gate_ckpt_path, device=device)
+    pivot0 = next(iter(pivot_by.values())) if pivot_by else 16
+    return eval_checkpoint(
+        ckpt_path,
+        wrapper,
+        list(bench_names),
+        val_samples,
+        model_name,
+        pivot_layer=pivot0,
+        device=device,
+        gate_model=gate_model,
+        gate_threshold=gate_threshold,
+        gate_threshold_by_bench=gate_threshold_by_bench,
+        gate_ckpt_path=gate_ckpt_path,
+        pivot_layer_by_bench=pivot_by,
+    )
 
 
 def _parse_gate_thresholds_by_bench(spec: Optional[str]) -> Optional[Dict[str, float]]:

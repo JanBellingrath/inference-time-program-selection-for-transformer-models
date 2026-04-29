@@ -5,7 +5,7 @@
 # ------
 #   1. data_prep.build_local_subset_catalog
 #         compositional manifest -> per-bench selected_catalog.json + route_subsets.json
-#   2. dr-llm/data_prep/dense_reevaluation.py (UNCHANGED, run per benchmark)
+#   2. python -m data_prep.dense_reevaluation (per benchmark)
 #         selected_catalog.json -> dense_deltas_matrix.pt
 #         (reuses the prefix-trie hidden-state caching; no new decoding code)
 #   3. data_prep.build_local_moebius_targets
@@ -18,7 +18,7 @@
 #   --output_root     where to put local_subsets/, decode/, local_moebius/
 #   --benchmarks      space-separated list, e.g. "commonsenseqa boolq"
 #   --model_name      e.g. Qwen/Qwen2.5-0.5B-Instruct
-#   --dr_llm_dir      path to the dr-llm checkout (contains data_prep/dense_reevaluation.py)
+#   [--dr_llm_dir]    deprecated, ignored (kept so old invocations parse)
 #   [--include_pairs] also enumerate pair subsets (needed for pair Mobius targets)
 #   [--split STR]     split passed to dense_reevaluation (default: validation)
 #   [--max_questions N] forwarded to dense_reevaluation (default: unset = all)
@@ -70,7 +70,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-for v in MANIFEST OUTPUT_ROOT BENCHMARKS MODEL_NAME DR_LLM_DIR; do
+if [[ -n "${DR_LLM_DIR:-}" ]]; then
+  echo "[build_local_moebius_supervision] ignoring deprecated --dr_llm_dir (${DR_LLM_DIR}); dense_eval runs from repo root." >&2
+fi
+
+for v in MANIFEST OUTPUT_ROOT BENCHMARKS MODEL_NAME; do
   if [[ -z "${!v}" ]]; then
     echo "Missing --$(echo "$v" | tr '[:upper:]' '[:lower:]')" >&2
     exit 2
@@ -93,7 +97,7 @@ python -m data_prep.build_local_subset_catalog \
   --benchmarks $BENCHMARKS \
   $PAIRS_FLAG
 
-echo "=== Stage 2: dense_reevaluation per benchmark (dr-llm, unchanged) ==="
+echo "=== Stage 2: dense_reevaluation per benchmark (this repo) ==="
 MAX_Q_FLAG=""
 if [[ -n "$MAX_QUESTIONS" ]]; then
   MAX_Q_FLAG="--max_questions $MAX_QUESTIONS"
@@ -107,8 +111,8 @@ for bench in $BENCHMARKS; do
   fi
   mkdir -p "$out_dir"
   echo "  -> $bench"
-  ( cd "$DR_LLM_DIR" && \
-    python data_prep/dense_reevaluation.py \
+  ( cd "$ROOT" && \
+    python -m data_prep.dense_reevaluation \
       --catalog_json "$cat_json" \
       --benchmarks "$bench" \
       --model_name "$MODEL_NAME" \

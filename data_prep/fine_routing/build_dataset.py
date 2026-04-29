@@ -195,7 +195,7 @@ def grade_sample_continuous(
     Falls back to binary grading for generative (multi-token) tasks
     where extracting a clean log-prob is not straightforward.
     """
-    if sample["max_new_tokens"] != 1:
+    if int(sample.get("max_new_tokens", 1)) != 1:
         return grade_sample(wrapper, layers, sample, dataset, model_name, is_math)
 
     logits = _forward_logits(

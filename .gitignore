@@ -17,6 +17,7 @@ ENV/
 # IDE
 .idea/
 .vscode/
+**/.ipynb_checkpoints/
 *.swp
 *.swo
 
@@ -74,3 +75,6 @@ smac3_output/
 hpo_results/
 tmp_bmcts*.json
 tmp_bmcts*.jsonl
+
+# Notebook outputs (large cached validation artifacts)
+notebooks/_*_validation_artifacts/

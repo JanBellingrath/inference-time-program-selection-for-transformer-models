@@ -175,7 +175,13 @@ def eval_checkpoint(
             if pred_idx == STAY_INDEX:
                 b_rout += anc_ok
             else:
-                cand_seq = global_idx_to_sequence(pred_idx, catalog, anchor_seqs[bench])
+                bench_override = None
+                pbc = meta.get("per_bench_catalog")
+                if isinstance(pbc, dict) and bench in pbc:
+                    bench_override = pbc[bench]
+                cand_seq = global_idx_to_sequence(
+                    pred_idx, catalog, anchor_seqs[bench], per_bench_override=bench_override,
+                )
                 cand_layers = seq_to_layers(cand_seq)
                 cand_resp = generate_under_layers(
                     wrapper,

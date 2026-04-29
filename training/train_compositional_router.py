@@ -89,6 +89,40 @@ def _infer_d_model(dataset: CompositionalDataset) -> int:
     return int(sample.shape[-1])
 
 
+def _dense_binary_missing_for_any_benchmark(
+    dataset: CompositionalDataset,
+    benchmarks: Sequence[str],
+) -> bool:
+    """True when some training benchmark has no mined binary sidecar in dense ``.pt``."""
+    for b in benchmarks:
+        if dataset.dense_deltas_binary_per_bench.get(b) is None:
+            return True
+    return False
+
+
+def _write_ephemeral_router_ckpt(
+    path: _Path,
+    *,
+    router: CompositionalRouter,
+    router_config: Dict[str, Any],
+    benchmarks: Sequence[str],
+    bench_to_id: Dict[str, int],
+    split_qids: Dict[str, Any],
+) -> None:
+    """Minimal checkpoint for :func:`experiments.eval_compositional_downstream.evaluate_checkpoint`."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state_dict": {k: v.detach().cpu() for k, v in router.state_dict().items()},
+            "config": router_config,
+            "benchmarks": list(benchmarks),
+            "bench_to_id": dict(bench_to_id),
+            "split_qids": split_qids,
+        },
+        path,
+    )
+
+
 def _build_compressor(
     compressor_type: str,
     d_model: int,
@@ -860,6 +894,10 @@ def train_one_router(
     train_test_holdout_count: int = 0,
     split_json_path: Optional[_Path] = None,
     use_hard_ce: bool = False,
+    external_llm_eval_every: int = 0,
+    external_llm_eval_max_samples: int = 300,
+    external_llm_model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
+    external_llm_ft_adapter: Optional[_Path] = None,
 ) -> Optional[Dict[str, Any]]:
     torch.manual_seed(seed)
     log_prefix = f"{wandb_prefix}/" if wandb_prefix else ""
@@ -1074,6 +1112,62 @@ def train_one_router(
     best_ckpt_score = float("inf") if checkpoint_metric == "loss" else float("-inf")
     epochs_since_improve = 0
 
+    router_payload_config: Dict[str, Any] = {
+        "d_latent": d_latent,
+        "num_positions": num_positions,
+        "compressor_type": compressor_type,
+        "compressor_d_compress": compressor_d_compress,
+        "compressor_n_heads": compressor_n_heads,
+        "compressor_n_latent": compressor_n_latent,
+        "encoder_hidden_dims": list(encoder_hidden_dims),
+        "encoder_dropout": encoder_dropout,
+        "freeze_compressor": freeze_compressor,
+        "use_id_embedding": use_id_embedding,
+        "edit_hidden_dims": list(edit_hidden_dims),
+        "edit_dropout": edit_dropout,
+        "edit_layer_norm_before": edit_layer_norm_before,
+        "edit_layer_norm_after": edit_layer_norm_after,
+        "unary_hidden_dims": list(unary_hidden_dims),
+        "unary_dropout": unary_dropout,
+        "use_full_sequence": use_full_sequence,
+        "lam": lam,
+        "tau": tau,
+        "student_temp": student_temp,
+        "use_pairs": use_pairs,
+        "pair_hidden_dims": list(pair_hidden_dims),
+        "pair_dropout": pair_dropout,
+        "pair_zero_init": pair_zero_init,
+        "pair_l2": pair_l2,
+        "pair_topk_primitives": pair_topk_primitives,
+        "use_local_unary": use_local_unary,
+        "use_local_pair": use_local_pair,
+        "local_alpha": local_alpha,
+        "local_pair_beta": local_pair_beta,
+        "checkpoint_metric": checkpoint_metric,
+        "use_anchor_bias": use_anchor_bias,
+        "use_hard_ce": use_hard_ce,
+    }
+    needs_llm_pp = _dense_binary_missing_for_any_benchmark(dataset, benchmarks)
+    ephemeral_eval_ckpt = output_path.parent / "._train_epoch_llm_eval_ckpt.pt"
+    llm_eval_wrapper_holder: Dict[str, Any] = {}
+    if needs_llm_pp:
+        logger.info(
+            "At least one benchmark has no dense binary sidecar — external LLM "
+            "grading can report true pp (needs --wandb, --split_json, "
+            "--external_llm_eval_every > 0; default cap %d val questions).",
+            external_llm_eval_max_samples,
+        )
+    if (
+        needs_llm_pp
+        and external_llm_eval_every > 0
+        and wandb_run is not None
+        and split_json_path is None
+    ):
+        logger.warning(
+            "External LLM eval would run but --split_json is unset; skipping "
+            "LLM grading (val_question_ids required)."
+        )
+
     for epoch in range(1, epochs + 1):
         train_metrics = _epoch(
             router, train_loader, bench_id_to_catalogue, lam, tau, student_temp, device,
@@ -1207,6 +1301,79 @@ def train_one_router(
                         dpayload[f"{log_prefix}downstream/{split}/{k}"] = v
                 dpayload[f"{log_prefix}epoch"] = epoch
                 wandb_run.log(dpayload, step=wb + epoch)
+        if (
+            needs_llm_pp
+            and wandb_run is not None
+            and external_llm_eval_every > 0
+            and (epoch % external_llm_eval_every == 0 or epoch == epochs)
+            and split_json_path is not None
+        ):
+            try:
+                from experiments.eval_compositional_downstream import evaluate_checkpoint
+                from core.flexible_models import FlexibleModelWrapper
+
+                if llm_eval_wrapper_holder.get("wrapper") is None:
+                    fa = external_llm_ft_adapter
+                    if fa is not None:
+                        from experiments.sweep_fine_routing import FTFlexibleModelWrapper
+
+                        llm_eval_wrapper_holder["wrapper"] = FTFlexibleModelWrapper.from_ft_adapter(
+                            external_llm_model_name, str(fa), rank=0,
+                        )
+                    else:
+                        llm_eval_wrapper_holder["wrapper"] = FlexibleModelWrapper(
+                            external_llm_model_name, rank=0,
+                        )
+                _write_ephemeral_router_ckpt(
+                    ephemeral_eval_ckpt,
+                    router=router,
+                    router_config=router_payload_config,
+                    benchmarks=benchmarks,
+                    bench_to_id=bench_to_id,
+                    split_qids=split_qids,
+                )
+                n_bench = max(1, len(benchmarks))
+                per_bench_cap = max(1, int(external_llm_eval_max_samples) // n_bench)
+                ft_path: Optional[_Path] = (
+                    _Path(external_llm_ft_adapter)
+                    if external_llm_ft_adapter is not None
+                    else None
+                )
+                summ = evaluate_checkpoint(
+                    catalogue_dir=_Path(artifacts.output_dir),
+                    checkpoint_path=ephemeral_eval_ckpt,
+                    split_json=_Path(split_json_path),
+                    benchmarks=list(benchmarks),
+                    model_name=external_llm_model_name,
+                    ft_adapter_path=ft_path,
+                    lam=lam,
+                    max_samples_per_bench=per_bench_cap,
+                    device=device,
+                    wrapper=llm_eval_wrapper_holder["wrapper"],
+                )
+                lp: Dict[str, Any] = {
+                    f"{log_prefix}llm_eval/val/unconditional_gain_pp": float(
+                        summ.get("unconditional_gain_pp", float("nan")),
+                    ),
+                    f"{log_prefix}llm_eval/val/router_acc": float(summ.get("router_acc", float("nan"))),
+                    f"{log_prefix}llm_eval/val/anchor_acc": float(summ.get("anchor_acc", float("nan"))),
+                    f"{log_prefix}llm_eval/val/n": float(summ.get("n", 0)),
+                    f"{log_prefix}epoch": epoch,
+                }
+                for bn, row in (summ.get("per_bench") or {}).items():
+                    if isinstance(row, dict):
+                        lp[f"{log_prefix}llm_eval/val/{bn}/uplift_pp"] = float(
+                            row.get("uplift_pp", float("nan")),
+                        )
+                        lp[f"{log_prefix}llm_eval/val/{bn}/n"] = float(row.get("n", 0))
+                wandb_run.log(lp, step=wb + epoch)
+                logger.info(
+                    "LLM validation eval epoch %d: n=%s unconditional_gain_pp=%.4f",
+                    epoch, summ.get("n"),
+                    float(summ.get("unconditional_gain_pp", float("nan"))),
+                )
+            except Exception:
+                logger.warning("external LLM validation eval failed", exc_info=True)
         if epoch == 1 or epoch % 5 == 0 or epoch == epochs:
             extra = ""
             if "mean_abs_pair_contrib" in val_metrics_e:
@@ -1559,6 +1726,34 @@ def _build_argparser() -> argparse.ArgumentParser:
                         "sampled questions per split (seed-pinned, stable across "
                         "epochs). Applies to per-epoch checkpoint eval and to the "
                         "periodic train+val logging eval. 0 means use the full split.")
+    p.add_argument(
+        "--external_llm_eval_every",
+        type=int,
+        default=1,
+        help="When >0 and any benchmark lacks dense binary tensors in the loaded "
+             ".pt, and --wandb plus --split_json are set: run "
+             "experiments.eval_compositional_downstream (true accuracy / pp) every "
+             "N epochs. 0 disables. Internal HPO callers leave this at 0.",
+    )
+    p.add_argument(
+        "--external_llm_eval_max_samples",
+        type=int,
+        default=300,
+        help="Max total validation questions across all benchmarks for external "
+             "LLM eval (split evenly per benchmark).",
+    )
+    p.add_argument(
+        "--external_llm_model_name",
+        type=str,
+        default="Qwen/Qwen2.5-0.5B-Instruct",
+        help="HF model id for external LLM eval.",
+    )
+    p.add_argument(
+        "--external_llm_ft_adapter",
+        type=_Path,
+        default=None,
+        help="Optional LoRA adapter dir (FTFlexibleModelWrapper) for external LLM eval.",
+    )
     p.add_argument("--early_stopping_patience", type=int, default=0,
                    help="Stop training when the checkpoint metric has not improved "
                         "for this many consecutive epochs. 0 disables early stopping.")
@@ -1734,6 +1929,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         use_dense_supervision=bool(args.use_dense_supervision),
         downstream_eval_every=int(args.downstream_eval_every),
         downstream_eval_subset=int(args.downstream_eval_subset),
+        external_llm_eval_every=int(args.external_llm_eval_every),
+        external_llm_eval_max_samples=int(args.external_llm_eval_max_samples),
+        external_llm_model_name=str(args.external_llm_model_name),
+        external_llm_ft_adapter=args.external_llm_ft_adapter,
         early_stopping_patience=int(args.early_stopping_patience),
         observed_path_overrides=observed_overrides,
         dense_keep_mask_paths=dense_keep_paths,
